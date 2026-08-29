@@ -15,11 +15,15 @@
 	Tab:CreateKeybind({Name = "Fly Bind", CurrentKeybind = "F", Flag = "FlyBind", Callback = function() end})
 	Tab:CreateColorPicker({Name = "Aura Color", CurrentColor = Color3.new(1, 0, 0), Flag = "AuraColor", Callback = function(c) end})
 	Tab:CreateButton({Name = "Test Button", Callback = function() end})
+	Tab:CreateConfigManager({DefaultName = "default"}) -- name box + Save, Load opens a flyout of saved configs
+	Tab:CreateKeybind({Name = "Toggle Menu", CurrentKeybind = "RightControl", Flag = "MenuToggleBind",
+		Callback = function() Window:ToggleVisible() end}) -- Flag'd, so the bind itself persists via SaveConfig
 
 	Library:Notify({Title = "Loaded", Text = "Script ready"})
 	Library:SetTheme("Light") -- or "Dark", or a raw {BgFrame = Color3...} table for a fully custom palette
-	Library:SaveConfig() -- writes every Flag'd control's current value to iosroblox_config.json
-	Library:LoadConfig() -- reads it back and re-applies (fires each control's Callback too)
+	Library:SaveConfig("default") -- writes every Flag'd control's current value to IOSRobloxUILib_Configs/default.json
+	Library:LoadConfig("default") -- reads it back and re-applies (fires each control's Callback too)
+	Window:ToggleVisible() -- show/hide the whole window; also driven by the draggable floating button and any Keybind wired to it
 ]]
 
 local TweenService = game:GetService("TweenService")
@@ -353,10 +357,37 @@ function Library:SetTheme(theme)
 	end
 end
 
--- Serializes every flagged control's current value to a JSON file via the executor's writefile. Color3
+-- Config files are named (not one fixed file) so a script can offer multiple saved presets — see
+-- Library:ListConfigs / CreateConfigManager below. All live under one folder in the executor's own
+-- sandboxed workspace (same writefile/readfile sandboxing note as everywhere else here, not a real OS path).
+Library.ConfigFolder = "IOSRobloxUILib_Configs"
+
+local function ensureConfigFolder()
+	local ok = pcall(function()
+		if not isfolder(Library.ConfigFolder) then
+			makefolder(Library.ConfigFolder)
+		end
+	end)
+	return ok
+end
+
+-- Strips anything that isn't filename-safe, so a typed name can't escape the config folder (e.g. a stray
+-- "../") or trip an executor's writefile/readfile on an unexpected character. Falls back to "config" for
+-- an empty/all-stripped name so Save never silently no-ops on a blank TextBox.
+local function sanitizeConfigName(name)
+	name = tostring(name or ""):gsub("[^%w%s%-_]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+	if name == "" then
+		name = "config"
+	end
+	return name
+end
+
+-- Serializes every flagged control's current value to a named JSON file under Library.ConfigFolder. Color3
 -- values aren't native JSON types, so they're wrapped as {__color3=true, R=,G=,B=} and unwrapped on load.
-function Library:SaveConfig(path)
-	path = path or "iosroblox_config.json"
+function Library:SaveConfig(name)
+	name = sanitizeConfigName(name or "default")
+	ensureConfigFolder()
+	local path = Library.ConfigFolder .. "/" .. name .. ".json"
 	local data = {}
 	for flag, control in pairs(self.Flags) do
 		local ok, value = pcall(function()
@@ -382,14 +413,15 @@ function Library:SaveConfig(path)
 	if not ok2 then
 		return false, "writefile failed: " .. tostring(err)
 	end
-	return true
+	return true, name
 end
 
--- Reads the JSON file back and calls :Set on every flagged control that has a matching key. Silently
--- skips flags with no live control (e.g. config was saved by a script version with more widgets) and
--- flags whose Set errors (e.g. a stale value out of a slider's current Range) rather than aborting.
-function Library:LoadConfig(path)
-	path = path or "iosroblox_config.json"
+-- Reads a named config's JSON file back and calls :Set on every flagged control that has a matching key.
+-- Silently skips flags with no live control (e.g. config was saved by a script version with more widgets)
+-- and flags whose Set errors (e.g. a stale value out of a slider's current Range) rather than aborting.
+function Library:LoadConfig(name)
+	name = sanitizeConfigName(name or "default")
+	local path = Library.ConfigFolder .. "/" .. name .. ".json"
 	local ok, raw = pcall(function()
 		return readfile(path)
 	end)
@@ -415,6 +447,43 @@ function Library:LoadConfig(path)
 				end)
 			end
 		end
+	end
+	return true, name
+end
+
+-- Lists saved config names (extension stripped), sorted alphabetically — feeds CreateConfigManager's
+-- "load" flyout. Returns {} (never errors) if the folder doesn't exist yet or listfiles isn't available.
+function Library:ListConfigs()
+	if not ensureConfigFolder() then
+		return {}
+	end
+	local ok, files = pcall(function()
+		return listfiles(Library.ConfigFolder)
+	end)
+	if not ok or not files then
+		return {}
+	end
+	local names = {}
+	for _, full in ipairs(files) do
+		local fname = full:match("([^/\\]+)$")
+		local nameOnly = fname and fname:match("^(.*)%.json$")
+		if nameOnly then
+			table.insert(names, nameOnly)
+		end
+	end
+	table.sort(names)
+	return names
+end
+
+-- Deletes one saved config file by name. Used by CreateConfigManager's per-row delete affordance.
+function Library:DeleteConfig(name)
+	name = sanitizeConfigName(name or "")
+	local path = Library.ConfigFolder .. "/" .. name .. ".json"
+	local ok, err = pcall(function()
+		delfile(path)
+	end)
+	if not ok then
+		return false, "delfile failed: " .. tostring(err)
 	end
 	return true
 end
@@ -820,6 +889,91 @@ function Library:CreateWindow(config)
 		Size = UDim2.fromOffset(WindowSize.X, WindowSize.Y),
 	})
 
+	-- ---- floating menu toggle button ----
+	-- A sibling of `sheet` on `screenGui`, not a child of it — so it stays visible and tappable even while
+	-- the menu itself is hidden (`Window:SetVisible(false)`), which is the whole point of a floating
+	-- toggle. Draggable with the same offset-accumulation idiom as the header drag above, but distinguishes
+	-- a drag from a tap by total pointer travel (`DRAG_THRESHOLD`) so dragging it around the screen doesn't
+	-- also toggle the menu on release.
+	local floatBtn = new("TextButton", {
+		Name = "FloatButton",
+		AnchorPoint = Vector2.new(1, 1),
+		Position = UDim2.new(1, -24, 1, -24),
+		Size = UDim2.fromOffset(48, 48),
+		BackgroundColor3 = Colors.BgCard,
+		BackgroundTransparency = 0.1,
+		AutoButtonColor = false,
+		Text = "",
+		Active = true,
+		ZIndex = 500, -- above every ZIndex used inside `sheet` (dock-toggle glyphs top out at 27, flyouts
+		-- at 10/11) so it's always reachable regardless of what's open when the menu gets hidden.
+		Parent = screenGui,
+	})
+	themed(floatBtn, "BackgroundColor3", "BgCard")
+	corner(floatBtn, Radius.Pill)
+	stroke(floatBtn, 0.75, 1.2)
+
+	-- simple 3-bar zero-asset "menu" glyph, same hand-built idiom as the dock-toggle's own icon above
+	local floatIcon = new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(18, 12),
+		BackgroundTransparency = 1,
+		Parent = floatBtn,
+	})
+	-- Roblox's Enum.VerticalAlignment has no "SpaceBetween" (only Top/Center/Bottom) — even spacing between
+	-- 3 fixed-height bars comes from Padding instead: 3 * 2px bars + 2 * 3px gaps = 12px, exactly filling
+	-- floatIcon's height, so Center/Top read identically here.
+	new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Vertical,
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+		Padding = UDim.new(0, 3),
+		Parent = floatIcon,
+	})
+	for i = 1, 3 do
+		local bar = new("Frame", {
+			Size = UDim2.new(1, 0, 0, 2),
+			BackgroundColor3 = Colors.TextPrimary,
+			BackgroundTransparency = 0.1,
+			BorderSizePixel = 0,
+			LayoutOrder = i,
+			Parent = floatIcon,
+		})
+		themed(bar, "BackgroundColor3", "TextPrimary")
+	end
+
+	-- forward-declared: assigned once `Window` exists below, called from the drag block's tap branch
+	local requestToggle = function() end
+	do
+		local dragging, dragStart, startPos, moved = false, nil, nil, false
+		local DRAG_THRESHOLD = 6 -- pixels; below this on release, treat it as a tap instead of a drag
+		floatBtn.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				moved = false
+				dragStart = input.Position
+				startPos = floatBtn.Position
+			end
+		end)
+		UserInputService.InputChanged:Connect(function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+				local delta = input.Position - dragStart
+				if not moved and delta.Magnitude > DRAG_THRESHOLD then
+					moved = true
+				end
+				floatBtn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+			end
+		end)
+		UserInputService.InputEnded:Connect(function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+				dragging = false
+				if not moved then
+					requestToggle()
+				end
+			end
+		end)
+	end
+
 	local Window = setmetatable({
 		ScreenGui = screenGui,
 		Sheet = sheet,
@@ -827,8 +981,11 @@ function Library:CreateWindow(config)
 		DockList = dockList,
 		Pages = pages,
 		Overlay = overlay,
+		FloatButton = floatBtn,
 		Tabs = {},
 		ActiveTab = nil,
+		Visible = true, -- whole-window visibility (Window:SetVisible/:ToggleVisible), distinct from the
+		-- dock-collapse toggle above which only hides the side dock while keeping the window itself shown
 		-- Every flyout-having widget (Dropdown/MultiDropdown/ColorPicker) re-points this to its own
 		-- "close myself" closure right when it opens, after first calling whatever was here before —
 		-- so opening one flyout auto-closes any other, and (see CreateTab's `activate`) switching tabs
@@ -838,7 +995,38 @@ function Library:CreateWindow(config)
 		CloseActiveFlyout = function() end,
 	}, WindowMeta)
 
+	requestToggle = function()
+		Window:ToggleVisible()
+	end
+
 	return Window
+end
+
+-- Shows/hides the whole window (`Sheet`) — what the floating button and any keybind wired to it call.
+-- Independent of the dock-collapse toggle (`menuBtn` in CreateWindow, which only collapses the side dock
+-- while keeping the window itself visible). Also closes whatever flyout might be open, so hiding the menu
+-- never leaves a dropdown/multi-dropdown/color-picker panel visually stranded behind a hidden sheet.
+function WindowMeta:SetVisible(visible)
+	if self.Visible == visible then
+		return
+	end
+	self.Visible = visible
+	self.CloseActiveFlyout()
+	if visible then
+		self.Sheet.Visible = true
+		tween(self.Sheet, Motion.Open, { BackgroundTransparency = 0.04 })
+	else
+		local closeTween = tween(self.Sheet, Motion.Tab, { BackgroundTransparency = 1 })
+		closeTween.Completed:Connect(function(state)
+			if state == Enum.PlaybackState.Completed and not self.Visible then
+				self.Sheet.Visible = false
+			end
+		end)
+	end
+end
+
+function WindowMeta:ToggleVisible()
+	self:SetVisible(not self.Visible)
 end
 
 function WindowMeta:CreateTab(config)
@@ -1546,6 +1734,256 @@ function TabMeta:CreateKeybind(config)
 		Library.Flags[config.Flag] = control
 	end
 	return control
+end
+
+-- Named config save/load UI on top of Library:SaveConfig/LoadConfig/ListConfigs/DeleteConfig. Doesn't
+-- register a Flag itself (there's no single persisted "value" here — it's an action panel, not a
+-- value-holding widget). `config.Callback`, if given, fires as (action, name, ok, err) after a save/load
+-- so a host script can toast the result the same way it would for any other widget's Callback.
+function TabMeta:CreateConfigManager(config)
+	config = config or {}
+	local defaultName = config.DefaultName or "default"
+	local callback = config.Callback or function() end
+
+	-- ---- row 1: name box + Save ----
+	local nameRow = baseRow(self, 40)
+	labelBlock(nameRow, "Config Name")
+
+	local nameBox = new("TextBox", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -56, 0.5, 0),
+		Size = UDim2.fromOffset(110, 26),
+		BackgroundColor3 = Colors.BgFrame,
+		Font = Fonts.SubBody,
+		Text = defaultName,
+		PlaceholderText = "name...",
+		PlaceholderColor3 = Colors.TextTertiary,
+		TextColor3 = Colors.TextPrimary,
+		TextSize = 11,
+		ClearTextOnFocus = false,
+		Parent = nameRow,
+	})
+	themed(nameBox, "BackgroundColor3", "BgFrame")
+	themed(nameBox, "TextColor3", "TextPrimary")
+	themed(nameBox, "PlaceholderColor3", "TextTertiary")
+	corner(nameBox, Radius.Slot)
+	stroke(nameBox, 0.85, 1)
+	pad(nameBox, nil, 0, 8, 0, 8)
+
+	local saveBtn = new("TextButton", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, 0, 0.5, 0),
+		Size = UDim2.fromOffset(48, 26),
+		BackgroundColor3 = Colors.AccentBlue,
+		AutoButtonColor = false,
+		Text = "",
+		Parent = nameRow,
+	})
+	themed(saveBtn, "BackgroundColor3", "AccentBlue")
+	corner(saveBtn, Radius.Slot)
+	local saveLabel = new("TextLabel", {
+		Font = Fonts.Body,
+		Text = "Save",
+		TextSize = 11,
+		TextColor3 = Colors.TextPrimary,
+		BackgroundTransparency = 1,
+		Size = UDim2.fromScale(1, 1),
+		Parent = saveBtn,
+	})
+	themed(saveLabel, "TextColor3", "TextPrimary")
+
+	saveBtn.MouseButton1Down:Connect(function()
+		tween(saveBtn, Motion.Press, { BackgroundTransparency = 0.35 })
+	end)
+	saveBtn.MouseButton1Up:Connect(function()
+		tween(saveBtn, Motion.Hover, { BackgroundTransparency = 0 })
+	end)
+	saveBtn.MouseButton1Click:Connect(function()
+		local ok, result = Library:SaveConfig(nameBox.Text)
+		if ok then
+			nameBox.Text = result -- reflect the sanitized final name back (e.g. trimmed, or the "config" fallback)
+		end
+		task.spawn(callback, "save", nameBox.Text, ok, result)
+	end)
+
+	-- ---- row 2: Load (opens the flyout list of saved configs) ----
+	local loadRow = baseRow(self, 36)
+	local loadBtn = new("TextButton", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "",
+		AutoButtonColor = false,
+		Parent = loadRow,
+	})
+	local loadLabel = new("TextLabel", {
+		Font = Fonts.Body,
+		Text = "Load Config ▾",
+		TextSize = 13,
+		TextColor3 = Colors.AccentBlue,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		BackgroundTransparency = 1,
+		Size = UDim2.fromScale(1, 1),
+		Parent = loadBtn,
+	})
+	themed(loadLabel, "TextColor3", "AccentBlue")
+	loadBtn.MouseButton1Down:Connect(function()
+		tween(loadRow, Motion.Press, { BackgroundTransparency = 0.2 })
+	end)
+	loadBtn.MouseButton1Up:Connect(function()
+		tween(loadRow, Motion.Hover, { BackgroundTransparency = 0.5 })
+	end)
+
+	-- ---- the flyout: same Overlay-parented pattern as Dropdown/MultiDropdown/ColorPicker (MASTER.md §12's
+	-- four rules), except its rows are rebuilt fresh on every open instead of fixed at widget-creation time
+	-- — unlike those widgets' static option lists, the saved-config set can change between opens (a save,
+	-- or a delete from this same panel).
+	local overlay = self.Window.Overlay
+	local sheet = overlay.Parent
+	local flyoutWidth = 150
+	local rowHeight = 26
+
+	local list = new("Frame", {
+		Name = "ConfigList",
+		Active = true,
+		ClipsDescendants = true,
+		Visible = false,
+		BackgroundTransparency = 1,
+		ZIndex = 10,
+		AnchorPoint = Vector2.new(1, 0),
+		Size = UDim2.fromOffset(flyoutWidth, 0),
+		BackgroundColor3 = Colors.BgFrame,
+		Parent = overlay,
+	})
+	themed(list, "BackgroundColor3", "BgFrame")
+	corner(list, Radius.Slot)
+	stroke(list, 0.85, 1)
+	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Parent = list })
+
+	local open = false
+	local setOpen -- forward-declared; rebuildRows (below) needs to call it to close-on-load
+
+	local function rebuildRows()
+		for _, child in ipairs(list:GetChildren()) do
+			if child:IsA("GuiObject") then
+				child:Destroy()
+			end
+		end
+		local names = Library:ListConfigs()
+		for i, cfgName in ipairs(names) do
+			local optRow = new("Frame", {
+				Size = UDim2.new(1, 0, 0, rowHeight),
+				BackgroundTransparency = 1,
+				LayoutOrder = i,
+				ZIndex = 10,
+				Parent = list,
+			})
+			local optBtn = new("TextButton", {
+				Name = "LoadOption",
+				Size = UDim2.new(1, -22, 1, 0),
+				BackgroundTransparency = 1,
+				Text = "",
+				ZIndex = 10,
+				Parent = optRow,
+			})
+			pad(optBtn, nil, 0, 0, 0, 8)
+			local optLabel = new("TextLabel", {
+				Font = Fonts.SubBody,
+				Text = cfgName,
+				TextSize = 11,
+				TextColor3 = Colors.TextSecondary,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				BackgroundTransparency = 1,
+				Size = UDim2.fromScale(1, 1),
+				ZIndex = 11,
+				Parent = optBtn,
+			})
+			themed(optLabel, "TextColor3", "TextSecondary")
+			local delBtn = new("TextButton", {
+				Name = "DeleteOption",
+				AnchorPoint = Vector2.new(1, 0.5),
+				Position = UDim2.new(1, -4, 0.5, 0),
+				Size = UDim2.fromOffset(16, 16),
+				BackgroundTransparency = 1,
+				Text = "×",
+				Font = Fonts.SubBody,
+				TextSize = 13,
+				TextColor3 = Colors.AccentRed,
+				ZIndex = 11,
+				Parent = optRow,
+			})
+			themed(delBtn, "TextColor3", "AccentRed")
+
+			optBtn.MouseButton1Click:Connect(function()
+				local ok, err = Library:LoadConfig(cfgName)
+				if ok then
+					nameBox.Text = cfgName
+				end
+				task.spawn(callback, "load", cfgName, ok, err)
+				setOpen(false)
+			end)
+			delBtn.MouseButton1Click:Connect(function()
+				Library:DeleteConfig(cfgName)
+				-- refresh in place (keep the flyout open so deleting several in a row works), and resize/
+				-- reposition to match — rebuildRows()'s returned height was previously discarded here, so
+				-- e.g. deleting down to a very different row count left the flyout's own Size stale.
+				local newHeight = rebuildRows()
+				positionFlyout(sheet, loadBtn, list, newHeight)
+				tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, newHeight) })
+			end)
+		end
+		if #names == 0 then
+			local emptyLabel = new("TextLabel", {
+				Font = Fonts.SubBody,
+				Text = "No saved configs",
+				TextSize = 11,
+				TextColor3 = Colors.TextTertiary,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				BackgroundTransparency = 1,
+				Size = UDim2.new(1, 0, 0, rowHeight),
+				ZIndex = 10,
+				Parent = list,
+			})
+			themed(emptyLabel, "TextColor3", "TextTertiary")
+		end
+		return math.max(#names, 1) * rowHeight
+	end
+
+	setOpen = function(value)
+		if open == value then
+			return
+		end
+		if value then
+			-- see MASTER.md §12 rule 4 / bug #15: call this BEFORE flipping `open`, so a self-referential
+			-- call (this exact widget still being the last-registered closer) sees the true pre-transition
+			-- state and no-ops instead of recursing into its own close branch mid-open.
+			self.Window.CloseActiveFlyout()
+		end
+		open = value
+		if open then
+			self.Window.CloseActiveFlyout = function()
+				if open then
+					setOpen(false)
+				end
+			end
+			local listHeight = rebuildRows()
+			positionFlyout(sheet, loadBtn, list, listHeight)
+			list.Visible = true
+			tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, listHeight), BackgroundTransparency = 0 })
+		else
+			local closeTween = tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, 0), BackgroundTransparency = 1 })
+			closeTween.Completed:Connect(function(state)
+				if state == Enum.PlaybackState.Completed and not open then
+					list.Visible = false
+				end
+			end)
+		end
+	end
+
+	loadBtn.MouseButton1Click:Connect(function()
+		setOpen(not open)
+	end)
+
+	return { Refresh = rebuildRows }
 end
 
 function TabMeta:CreateMultiDropdown(config)

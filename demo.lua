@@ -80,10 +80,11 @@ Player:CreateKeybind({
 	ChangedCallback = function(k) print("Fly Bind rebound ->", k) end,
 })
 
--- ================= Settings: theme, notify, config save/load =================
+-- ================= Settings: theme, notify, floating button, config save/load =================
 local Settings = Window:CreateTab({ Name = "Settings", Icon = "dot" })
 
 Settings:CreateLabel({ Text = "Window drag: try dragging the header up top" })
+Settings:CreateLabel({ Text = "Floating button (bottom-right of screen) drags freely; tap it to hide/show the whole menu" })
 Settings:CreateButton({
 	Name = "Theme: Dark",
 	Callback = function() Library:SetTheme("Dark") end,
@@ -92,24 +93,28 @@ Settings:CreateButton({
 	Name = "Theme: Light",
 	Callback = function() Library:SetTheme("Light") end,
 })
-Settings:CreateButton({
-	Name = "Save Config",
-	Callback = function()
-		local ok, err = Library:SaveConfig()
-		Library:Notify({
-			Title = ok and "Config Saved" or "Save Failed",
-			Text = ok and "Every flagged widget's value was written to disk." or tostring(err),
-		})
-	end,
+Settings:CreateKeybind({
+	Name = "Toggle Menu",
+	CurrentKeybind = "RightControl",
+	Flag = "MenuToggleBind", -- Flag'd like any other widget, so the chosen bind itself round-trips through
+	-- Library:SaveConfig/LoadConfig automatically — no special-case code needed for "a keybind in the config"
+	Callback = function() Window:ToggleVisible() end,
+	ChangedCallback = function(k) print("Menu toggle rebound ->", k) end,
 })
-Settings:CreateButton({
-	Name = "Load Config",
-	Callback = function()
-		local ok, err = Library:LoadConfig()
-		Library:Notify({
-			Title = ok and "Config Loaded" or "Load Failed",
-			Text = ok and "Every flagged widget was restored (callbacks included)." or tostring(err),
-		})
+Settings:CreateConfigManager({
+	DefaultName = "default",
+	Callback = function(action, name, ok, err)
+		if action == "save" then
+			Library:Notify({
+				Title = ok and ("Saved \"" .. name .. "\"") or "Save Failed",
+				Text = ok and "Every flagged widget's value was written to disk." or tostring(err),
+			})
+		elseif action == "load" then
+			Library:Notify({
+				Title = ok and ("Loaded \"" .. name .. "\"") or "Load Failed",
+				Text = ok and "Every flagged widget was restored (callbacks included)." or tostring(err),
+			})
+		end
 	end,
 })
 Settings:CreateButton({
