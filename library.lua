@@ -15,9 +15,11 @@
 	Tab:CreateKeybind({Name = "Fly Bind", CurrentKeybind = "F", Flag = "FlyBind", Callback = function() end})
 	Tab:CreateColorPicker({Name = "Aura Color", CurrentColor = Color3.new(1, 0, 0), Flag = "AuraColor", Callback = function(c) end})
 	Tab:CreateButton({Name = "Test Button", Callback = function() end})
-	Tab:CreateConfigManager({DefaultName = "default"}) -- name box + Save, Load opens a flyout of saved configs
 	Tab:CreateKeybind({Name = "Toggle Menu", CurrentKeybind = "RightControl", Flag = "MenuToggleBind",
 		Callback = function() Window:ToggleVisible() end}) -- Flag'd, so the bind itself persists via SaveConfig
+
+	local Config = Tab:CreateSection({Title = "Config"}) -- groups widgets under one titled card
+	Config:CreateConfigManager() -- [Save Config][name box], [Load Config][selection box] (flyout of saved configs)
 
 	Library:Notify({Title = "Loaded", Text = "Script ready"})
 	Library:SetTheme("Light") -- or "Dark", or a raw {BgFrame = Color3...} table for a fully custom palette
@@ -1123,17 +1125,22 @@ end
 
 -- ---- shared row scaffold ----
 
+-- `tab.FlatRows` (set by CreateSection below) skips each row's own BgCard tint — used when rows are
+-- already sitting inside a Section's own card, where a per-row tint on top of the section's card would
+-- double up into a slightly muddy card-on-card look instead of one clean grouped card.
 local function baseRow(tab, height)
 	tab.RowCount += 1
 	local row = new("Frame", {
 		Name = "Row" .. tab.RowCount,
 		Size = UDim2.new(1, 0, 0, height or 40),
 		BackgroundColor3 = Colors.BgCard,
-		BackgroundTransparency = 0.5,
+		BackgroundTransparency = tab.FlatRows and 1 or 0.5,
 		LayoutOrder = tab.RowCount,
 		Parent = tab.Page,
 	})
-	themed(row, "BackgroundColor3", "BgCard") -- covers every widget's row background in one place
+	if not tab.FlatRows then
+		themed(row, "BackgroundColor3", "BgCard") -- covers every widget's row background in one place
+	end
 	corner(row, Radius.Card - 2)
 	pad(row, nil, 8, 10, 8, 10)
 	return row
@@ -1215,6 +1222,71 @@ function TabMeta:CreateLabel(config)
 	})
 	themed(label, "TextColor3", "TextSecondary")
 	return row
+end
+
+-- Groups related widgets under one titled card (e.g. "Theme", "Config") instead of them sitting as loose
+-- rows in the tab — the grouped-table-view convention this library's Apple HIG look already leans on
+-- everywhere else. Returns a Section object carrying the exact same TabMeta metatable as a real Tab —
+-- its `Page` just points at the section's own inner body instead of the tab's page, and it keeps its own
+-- `RowCount` — so every existing `CreateXxx` widget constructor works inside a section completely
+-- unchanged, including ones with their own Overlay-parented flyouts (`Window` is threaded through as-is).
+function TabMeta:CreateSection(config)
+	config = config or {}
+	local title = config.Title or config.Name or "Section"
+
+	self.RowCount += 1
+	local container = new("Frame", {
+		Name = "Section" .. self.RowCount,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = Colors.BgFrame,
+		BackgroundTransparency = 0.5,
+		LayoutOrder = self.RowCount,
+		Parent = self.Page,
+	})
+	themed(container, "BackgroundColor3", "BgFrame")
+	corner(container, Radius.Card)
+	stroke(container, 0.9, 1)
+	pad(container, nil, 10, 12, 10, 12)
+	new("UIListLayout", {
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, 6),
+		Parent = container,
+	})
+
+	local headerLabel = new("TextLabel", {
+		Font = Fonts.Body,
+		Text = title,
+		TextSize = 12,
+		TextColor3 = Colors.TextSecondary,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 16),
+		LayoutOrder = 0,
+		Parent = container,
+	})
+	themed(headerLabel, "TextColor3", "TextSecondary")
+
+	local body = new("Frame", {
+		Name = "Body",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = 1,
+		Parent = container,
+	})
+	new("UIListLayout", {
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, Spacing.RowGap),
+		Parent = body,
+	})
+
+	return setmetatable({
+		Window = self.Window,
+		Page = body,
+		RowCount = 0,
+		FlatRows = true,
+	}, TabMeta)
 end
 
 function TabMeta:CreateToggle(config)
@@ -1740,28 +1812,56 @@ end
 -- register a Flag itself (there's no single persisted "value" here — it's an action panel, not a
 -- value-holding widget). `config.Callback`, if given, fires as (action, name, ok, err) after a save/load
 -- so a host script can toast the result the same way it would for any other widget's Callback.
+-- Split button+box layout: [Save Config][name box] then [Load Config][selection box], each pair a 50/50
+-- row split rather than the usual label+control row shape — meant to sit inside a CreateSection card (see
+-- "Config" in demo.lua) alongside a similarly-shaped Theme section. Picking a config from the selection
+-- box just loads it into the box (doesn't apply it) — pressing "Load Config" is the separate, deliberate
+-- commit step, so a stray tap while browsing saved configs can't silently reset your live widget state.
 function TabMeta:CreateConfigManager(config)
 	config = config or {}
-	local defaultName = config.DefaultName or "default"
-	local callback = config.Callback or function() end
+	local callback = config.Callback or function() end -- (action, name, ok, err)
 
-	-- ---- row 1: name box + Save ----
-	local nameRow = baseRow(self, 40)
-	labelBlock(nameRow, "Config Name")
+	-- ---- row 1: Save Config (left) + name box (right) ----
+	local saveRow = baseRow(self, 40)
+	local saveBtn = new("TextButton", {
+		Size = UDim2.new(0.5, -4, 1, 0),
+		BackgroundColor3 = Colors.AccentBlue,
+		AutoButtonColor = false,
+		Text = "",
+		Parent = saveRow,
+	})
+	themed(saveBtn, "BackgroundColor3", "AccentBlue")
+	corner(saveBtn, Radius.Slot)
+	local saveLabel = new("TextLabel", {
+		Font = Fonts.Body,
+		Text = "Save Config",
+		TextSize = 12,
+		TextColor3 = Colors.TextPrimary,
+		BackgroundTransparency = 1,
+		Size = UDim2.fromScale(1, 1),
+		Parent = saveBtn,
+	})
+	themed(saveLabel, "TextColor3", "TextPrimary")
+	saveBtn.MouseButton1Down:Connect(function()
+		tween(saveBtn, Motion.Press, { BackgroundTransparency = 0.35 })
+	end)
+	saveBtn.MouseButton1Up:Connect(function()
+		tween(saveBtn, Motion.Hover, { BackgroundTransparency = 0 })
+	end)
 
 	local nameBox = new("TextBox", {
 		AnchorPoint = Vector2.new(1, 0.5),
-		Position = UDim2.new(1, -56, 0.5, 0),
-		Size = UDim2.fromOffset(110, 26),
+		Position = UDim2.new(1, 0, 0.5, 0),
+		Size = UDim2.new(0.5, -4, 0, 26),
 		BackgroundColor3 = Colors.BgFrame,
 		Font = Fonts.SubBody,
-		Text = defaultName,
-		PlaceholderText = "name...",
+		Text = config.DefaultName or "",
+		PlaceholderText = "config name...",
 		PlaceholderColor3 = Colors.TextTertiary,
 		TextColor3 = Colors.TextPrimary,
 		TextSize = 11,
 		ClearTextOnFocus = false,
-		Parent = nameRow,
+		Parent = saveRow,
 	})
 	themed(nameBox, "BackgroundColor3", "BgFrame")
 	themed(nameBox, "TextColor3", "TextPrimary")
@@ -1770,68 +1870,61 @@ function TabMeta:CreateConfigManager(config)
 	stroke(nameBox, 0.85, 1)
 	pad(nameBox, nil, 0, 8, 0, 8)
 
-	local saveBtn = new("TextButton", {
-		AnchorPoint = Vector2.new(1, 0.5),
-		Position = UDim2.new(1, 0, 0.5, 0),
-		Size = UDim2.fromOffset(48, 26),
-		BackgroundColor3 = Colors.AccentBlue,
-		AutoButtonColor = false,
-		Text = "",
-		Parent = nameRow,
-	})
-	themed(saveBtn, "BackgroundColor3", "AccentBlue")
-	corner(saveBtn, Radius.Slot)
-	local saveLabel = new("TextLabel", {
-		Font = Fonts.Body,
-		Text = "Save",
-		TextSize = 11,
-		TextColor3 = Colors.TextPrimary,
-		BackgroundTransparency = 1,
-		Size = UDim2.fromScale(1, 1),
-		Parent = saveBtn,
-	})
-	themed(saveLabel, "TextColor3", "TextPrimary")
-
-	saveBtn.MouseButton1Down:Connect(function()
-		tween(saveBtn, Motion.Press, { BackgroundTransparency = 0.35 })
-	end)
-	saveBtn.MouseButton1Up:Connect(function()
-		tween(saveBtn, Motion.Hover, { BackgroundTransparency = 0 })
-	end)
 	saveBtn.MouseButton1Click:Connect(function()
-		local ok, result = Library:SaveConfig(nameBox.Text)
-		if ok then
-			nameBox.Text = result -- reflect the sanitized final name back (e.g. trimmed, or the "config" fallback)
-		end
-		task.spawn(callback, "save", nameBox.Text, ok, result)
+		local typedName = nameBox.Text
+		local ok, result = Library:SaveConfig(typedName)
+		task.spawn(callback, "save", ok and result or typedName, ok, result)
+		nameBox.Text = "" -- clear right after saving, ready for the next name (placeholder shows again)
 	end)
 
-	-- ---- row 2: Load (opens the flyout list of saved configs) ----
-	local loadRow = baseRow(self, 36)
+	-- ---- row 2: Load Config (left) + selection box (right, opens the flyout of saved configs) ----
+	local loadRow = baseRow(self, 40)
 	local loadBtn = new("TextButton", {
-		Size = UDim2.fromScale(1, 1),
-		BackgroundTransparency = 1,
-		Text = "",
+		Size = UDim2.new(0.5, -4, 1, 0),
+		BackgroundColor3 = Colors.BgFrame,
 		AutoButtonColor = false,
+		Text = "",
 		Parent = loadRow,
 	})
+	themed(loadBtn, "BackgroundColor3", "BgFrame")
+	corner(loadBtn, Radius.Slot)
+	stroke(loadBtn, 0.85, 1)
 	local loadLabel = new("TextLabel", {
 		Font = Fonts.Body,
-		Text = "Load Config ▾",
-		TextSize = 13,
+		Text = "Load Config",
+		TextSize = 12,
 		TextColor3 = Colors.AccentBlue,
-		TextXAlignment = Enum.TextXAlignment.Center,
 		BackgroundTransparency = 1,
 		Size = UDim2.fromScale(1, 1),
 		Parent = loadBtn,
 	})
 	themed(loadLabel, "TextColor3", "AccentBlue")
-	loadBtn.MouseButton1Down:Connect(function()
-		tween(loadRow, Motion.Press, { BackgroundTransparency = 0.2 })
-	end)
-	loadBtn.MouseButton1Up:Connect(function()
-		tween(loadRow, Motion.Hover, { BackgroundTransparency = 0.5 })
-	end)
+
+	local selectBtn = new("TextButton", {
+		Name = "ConfigSelectBox",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, 0, 0.5, 0),
+		Size = UDim2.new(0.5, -4, 0, 26),
+		BackgroundColor3 = Colors.BgFrame,
+		AutoButtonColor = false,
+		Text = "",
+		Parent = loadRow,
+	})
+	themed(selectBtn, "BackgroundColor3", "BgFrame")
+	corner(selectBtn, Radius.Slot)
+	stroke(selectBtn, 0.85, 1)
+	local selectLabel = new("TextLabel", {
+		Font = Fonts.SubBody,
+		Text = "None",
+		TextSize = 11,
+		TextColor3 = Colors.TextSecondary,
+		BackgroundTransparency = 1,
+		Size = UDim2.fromScale(1, 1),
+		Parent = selectBtn,
+	})
+	themed(selectLabel, "TextColor3", "TextSecondary")
+
+	local selected = nil
 
 	-- ---- the flyout: same Overlay-parented pattern as Dropdown/MultiDropdown/ColorPicker (MASTER.md §12's
 	-- four rules), except its rows are rebuilt fresh on every open instead of fixed at widget-creation time
@@ -1860,7 +1953,7 @@ function TabMeta:CreateConfigManager(config)
 	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Parent = list })
 
 	local open = false
-	local setOpen -- forward-declared; rebuildRows (below) needs to call it to close-on-load
+	local setOpen -- forward-declared; rebuildRows (below) needs to call it to close-on-pick
 
 	local function rebuildRows()
 		for _, child in ipairs(list:GetChildren()) do
@@ -1913,21 +2006,27 @@ function TabMeta:CreateConfigManager(config)
 			})
 			themed(delBtn, "TextColor3", "AccentRed")
 
+			-- Picking a row only loads it INTO the selection box — it does not call Library:LoadConfig.
+			-- "Load Config" (the button on this row's other half) is the deliberate commit step.
 			optBtn.MouseButton1Click:Connect(function()
-				local ok, err = Library:LoadConfig(cfgName)
-				if ok then
-					nameBox.Text = cfgName
-				end
-				task.spawn(callback, "load", cfgName, ok, err)
+				selected = cfgName
+				selectLabel.Text = cfgName
 				setOpen(false)
 			end)
 			delBtn.MouseButton1Click:Connect(function()
 				Library:DeleteConfig(cfgName)
+				if selected == cfgName then
+					-- the box was pointing at a config that no longer exists — clear it rather than let
+					-- "Load Config" silently try (and fail) to load a file that was just deleted out from
+					-- under it.
+					selected = nil
+					selectLabel.Text = "None"
+				end
 				-- refresh in place (keep the flyout open so deleting several in a row works), and resize/
-				-- reposition to match — rebuildRows()'s returned height was previously discarded here, so
-				-- e.g. deleting down to a very different row count left the flyout's own Size stale.
+				-- reposition to match — a discarded rebuildRows() height here previously left the flyout's
+				-- own Size stale against its new row count (caught live, see SESSION_NOTES.md).
 				local newHeight = rebuildRows()
-				positionFlyout(sheet, loadBtn, list, newHeight)
+				positionFlyout(sheet, selectBtn, list, newHeight)
 				tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, newHeight) })
 			end)
 		end
@@ -1966,7 +2065,7 @@ function TabMeta:CreateConfigManager(config)
 				end
 			end
 			local listHeight = rebuildRows()
-			positionFlyout(sheet, loadBtn, list, listHeight)
+			positionFlyout(sheet, selectBtn, list, listHeight)
 			list.Visible = true
 			tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, listHeight), BackgroundTransparency = 0 })
 		else
@@ -1979,8 +2078,23 @@ function TabMeta:CreateConfigManager(config)
 		end
 	end
 
-	loadBtn.MouseButton1Click:Connect(function()
+	selectBtn.MouseButton1Click:Connect(function()
 		setOpen(not open)
+	end)
+
+	loadBtn.MouseButton1Down:Connect(function()
+		tween(loadBtn, Motion.Press, { BackgroundTransparency = 0.2 })
+	end)
+	loadBtn.MouseButton1Up:Connect(function()
+		tween(loadBtn, Motion.Hover, { BackgroundTransparency = 0 })
+	end)
+	loadBtn.MouseButton1Click:Connect(function()
+		if not selected then
+			task.spawn(callback, "load", nil, false, "no config selected")
+			return
+		end
+		local ok, err = Library:LoadConfig(selected)
+		task.spawn(callback, "load", selected, ok, err)
 	end)
 
 	return { Refresh = rebuildRows }

@@ -81,18 +81,13 @@ Player:CreateKeybind({
 })
 
 -- ================= Settings: theme, notify, floating button, config save/load =================
+-- "Theme" and "Config" are grouped under CreateSection cards (rather than loose buttons/rows) — the
+-- sketch this was redesigned from specifically asked for a Theme section and a config-menu section, each
+-- reading as one titled card instead of scattered controls.
 local Settings = Window:CreateTab({ Name = "Settings", Icon = "dot" })
 
 Settings:CreateLabel({ Text = "Window drag: try dragging the header up top" })
 Settings:CreateLabel({ Text = "Floating button (bottom-right of screen) drags freely; tap it to hide/show the whole menu" })
-Settings:CreateButton({
-	Name = "Theme: Dark",
-	Callback = function() Library:SetTheme("Dark") end,
-})
-Settings:CreateButton({
-	Name = "Theme: Light",
-	Callback = function() Library:SetTheme("Light") end,
-})
 Settings:CreateKeybind({
 	Name = "Toggle Menu",
 	CurrentKeybind = "RightControl",
@@ -101,8 +96,17 @@ Settings:CreateKeybind({
 	Callback = function() Window:ToggleVisible() end,
 	ChangedCallback = function(k) print("Menu toggle rebound ->", k) end,
 })
-Settings:CreateConfigManager({
-	DefaultName = "default",
+
+local ThemeSection = Settings:CreateSection({ Title = "Theme" })
+ThemeSection:CreateDropdown({
+	Name = "Theme",
+	Options = { "Dark", "Light" },
+	CurrentOption = "Dark",
+	Callback = function(v) Library:SetTheme(v) end,
+})
+
+local ConfigSection = Settings:CreateSection({ Title = "Config" })
+ConfigSection:CreateConfigManager({
 	Callback = function(action, name, ok, err)
 		if action == "save" then
 			Library:Notify({
@@ -117,6 +121,7 @@ Settings:CreateConfigManager({
 		end
 	end,
 })
+
 Settings:CreateButton({
 	Name = "Test Notify",
 	Callback = function()
