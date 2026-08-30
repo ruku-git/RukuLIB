@@ -5,11 +5,11 @@
 	Tokens (color / radius / spacing / motion) mirror MASTER.md 1:1.
 
 	local UI = loadstring(game:HttpGet("..."))()
-	local Window = UI:CreateWindow({Name = "iOS Exploit", Subtitle = "Premium Suite"}) -- drag by the header to move it
+	local Window = UI:CreateWindow({Name = "iOS Exploit", Subtitle = "Premium Suite"}) -- drag by the header to move it, drag the bottom-right corner grip to resize (400x280 to 900x700)
 	local Tab = Window:CreateTab({Name = "Main", Icon = 12345})
 	Tab:CreateToggle({Name = "Fly Hack", Flag = "FlyHack", Callback = function(v) print(v) end})
-	Tab:CreateSlider({Name = "Speed", Range = {16, 200}, CurrentValue = 16, Flag = "Speed", Callback = function(v) end})
-	Tab:CreateDropdown({Name = "Mode", Options = {"Walk", "Noclip"}, Flag = "Mode", Callback = function(v) end})
+	local speedSlider = Tab:CreateSlider({Name = "Speed", Range = {16, 200}, CurrentValue = 16, Flag = "Speed", Callback = function(v) end})
+	local modeDropdown = Tab:CreateDropdown({Name = "Mode", Options = {"Walk", "Noclip"}, Flag = "Mode", Callback = function(v) end})
 	Tab:CreateMultiDropdown({Name = "ESP", Options = {"Boxes", "Names"}, Flag = "ESP", Callback = function(list) end})
 	Tab:CreateInput({Name = "Player", PlaceholderText = "username", Flag = "Player", Callback = function(v) end})
 	Tab:CreateKeybind({Name = "Fly Bind", CurrentKeybind = "F", Flag = "FlyBind", Callback = function() end})
@@ -17,6 +17,13 @@
 	Tab:CreateButton({Name = "Test Button", Callback = function() end})
 	Tab:CreateKeybind({Name = "Toggle Menu", CurrentKeybind = "RightControl", Flag = "MenuToggleBind",
 		Callback = function() Window:ToggleVisible() end}) -- Flag'd, so the bind itself persists via SaveConfig
+
+	-- every widget above shares this lifecycle: control:SetVisible(bool), control:SetEnabled(bool) (dims +
+	-- blocks input, doesn't just ignore the value), control:SetName(str), control:SetDescription(str) (no-op
+	-- on a widget with no label/description slot — Button/Label/Slider), control:Destroy() (tears down just
+	-- this row, unregisters its Flag).
+	speedSlider:SetEnabled(false) -- e.g. grey out until some other toggle turns the feature on
+	modeDropdown:Refresh({"Walk", "Noclip", "Fly"}) -- Dropdown/MultiDropdown only: swap the option list live
 
 	local Config = Tab:CreateSection({Title = "Config"}) -- groups widgets under one titled card
 	Config:CreateConfigManager() -- [Save Config][name box], [Load Config][selection box] (flyout of saved configs)
@@ -71,6 +78,12 @@ local Spacing = {
 }
 
 local WindowSize = Vector2.new(550, 350)
+-- Bounds for the drag-to-resize handle (bottom-right corner of the sheet). Min keeps the dock (64px) plus
+-- enough content width/height to still be usable rather than degenerating into a sliver; max is generous
+-- but not "grows to fill the phone screen" — same "no clamping against the actual screen" precedent as the
+-- window/float-button drag already sets, just bounded on the size axis instead of the position one.
+local WindowMinSize = Vector2.new(400, 280)
+local WindowMaxSize = Vector2.new(900, 700)
 
 local Motion = {
 	Open   = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
@@ -564,12 +577,22 @@ local function ensureNotifyLayer()
 	if notifyStack and notifyStack.Parent then
 		return notifyStack
 	end
+	-- `notifyGui`/`notifyStack` are plain locals, so a full script re-execution (fresh `loadstring()`, this
+	-- project's own normal dev loop) starts them at nil with no idea a previous execution's toast layer is
+	-- still sitting in `guiParent` under the same name — unlike "IOSRobloxUILib" itself, which CreateWindow
+	-- already finds-and-destroys by name for exactly this reason. Left unfixed, every re-execution left
+	-- behind one more orphaned (if empty, since toasts self-destruct) "IOSRobloxUILibNotify" ScreenGui.
+	local guiParent = getGuiParent()
+	local existing = guiParent:FindFirstChild("IOSRobloxUILibNotify")
+	if existing then
+		existing:Destroy()
+	end
 	notifyGui = new("ScreenGui", {
 		Name = "IOSRobloxUILibNotify",
 		ResetOnSpawn = false,
 		ZIndexBehavior = Enum.ZIndexBehavior.Global,
 		DisplayOrder = 1000, -- above the main window (999) so a toast is never hidden behind it
-		Parent = getGuiParent(),
+		Parent = guiParent,
 	})
 	protect(notifyGui)
 	notifyStack = new("Frame", {
@@ -876,6 +899,81 @@ function Library:CreateWindow(config)
 			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
 				local delta = input.Position - dragStart
 				sheet.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+			end
+		end))
+	end
+
+	-- ---- window resize (bottom-right corner handle) ----
+	-- Same offset-accumulation drag idiom as the header drag just above, but grows/shrinks `sheet.Size`
+	-- instead of moving `sheet.Position`, clamped to WindowMinSize/WindowMaxSize. Nothing downstream needed
+	-- any changes for this to work: Dock/Content/Pages/tab rows are all already Scale-relative to `sheet`,
+	-- and `positionFlyout` already reads `sheet.AbsoluteSize` fresh at open-time rather than caching it —
+	-- both were built that way for the dock-collapse/expand tween, which already resizes `content` live.
+	local resizeHandle = new("TextButton", {
+		Name = "ResizeHandle",
+		AnchorPoint = Vector2.new(1, 1),
+		-- inset by roughly Radius.Sheet (20px), not just a couple pixels — `sheet`'s ClipsDescendants only
+		-- clips to its rectangular bounds (not the rounded silhouette, same caveat as the dock's own
+		-- RightSquareOff patch notes elsewhere in this file), so a handle sitting right at the literal
+		-- pixel corner would visually straddle the curve, appearing to float past the rounded edge onto
+		-- whatever's behind the sheet, instead of reading as part of the sheet itself.
+		Position = UDim2.new(1, -(Radius.Sheet - 2), 1, -(Radius.Sheet - 2)),
+		Size = UDim2.fromOffset(18, 18),
+		BackgroundTransparency = 1,
+		AutoButtonColor = false,
+		Text = "",
+		ZIndex = 30, -- above the dock-toggle glyphs (top out at 27); flyouts (10/11, 500 for FloatButton)
+		-- never overlap this corner so ordering against them doesn't matter
+		Parent = sheet,
+	})
+	local resizeGlyph = new("Frame", {
+		AnchorPoint = Vector2.new(1, 1),
+		Position = UDim2.new(1, -4, 1, -4),
+		Size = UDim2.fromOffset(10, 10),
+		BackgroundTransparency = 1,
+		ZIndex = 31,
+		Parent = resizeHandle,
+	})
+	-- classic 6-dot triangular resize grip: 3 diagonal rows (1, 2, 3 dots) built from the glyph's own
+	-- bottom-right corner outward — same hand-built zero-asset idiom as every other icon in this file
+	for diag = 0, 2 do
+		for i = 0, diag do
+			local dx, dy = i * 4, (diag - i) * 4
+			local dot = new("Frame", {
+				AnchorPoint = Vector2.new(1, 1),
+				Position = UDim2.new(1, -dx, 1, -dy),
+				Size = UDim2.fromOffset(2, 2),
+				BackgroundColor3 = Colors.TextTertiary,
+				BackgroundTransparency = 0.3,
+				ZIndex = 31,
+				Parent = resizeGlyph,
+			})
+			corner(dot, 1)
+			themed(dot, "BackgroundColor3", "TextTertiary")
+		end
+	end
+
+	do
+		local dragging = false
+		local dragStart, startSize
+		resizeHandle.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				dragStart = input.Position
+				startSize = sheet.Size
+			end
+		end)
+		trackConnection(UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = false
+			end
+		end))
+		trackConnection(UserInputService.InputChanged:Connect(function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+				local delta = input.Position - dragStart
+				local newWidth = math.clamp(startSize.X.Offset + delta.X, WindowMinSize.X, WindowMaxSize.X)
+				local newHeight = math.clamp(startSize.Y.Offset + delta.Y, WindowMinSize.Y, WindowMaxSize.Y)
+				sheet.Size = UDim2.new(startSize.X.Scale, newWidth, startSize.Y.Scale, newHeight)
 			end
 		end))
 	end
@@ -1247,7 +1345,27 @@ local function baseRow(tab, height)
 	end
 	corner(row, Radius.Card - 2)
 	pad(row, nil, 8, 10, 8, 10)
-	return row
+
+	-- Dim-and-block layer every widget's `SetEnabled(false)` shows/hides, instead of each `CreateXxx`
+	-- reinventing its own disabled look. Built here (not per-widget) so it sits above whatever content a
+	-- widget adds afterward regardless of creation order — this file's ZIndexBehavior is Global (see
+	-- CreateWindow's own comment on why), so an explicit ZIndex wins over insertion order either way.
+	-- Active=true so it actually eats clicks/drags meant for the row's real controls while shown; Visible
+	-- starts false so a control that's never disabled pays nothing beyond one extra idle Instance.
+	local disableOverlay = new("Frame", {
+		Name = "DisabledOverlay",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Colors.BgBase,
+		BackgroundTransparency = 0.45,
+		Active = true,
+		Visible = false,
+		ZIndex = 5,
+		Parent = row,
+	})
+	corner(disableOverlay, Radius.Card - 2)
+	themed(disableOverlay, "BackgroundColor3", "BgBase")
+
+	return row, disableOverlay
 end
 
 local function labelBlock(row, title, desc)
@@ -1267,8 +1385,9 @@ local function labelBlock(row, title, desc)
 		Parent = block,
 	})
 	themed(titleLabel, "TextColor3", "TextPrimary")
+	local descLabel = nil
 	if desc and desc ~= "" then
-		local descLabel = new("TextLabel", {
+		descLabel = new("TextLabel", {
 			Font = Fonts.SubBody,
 			Text = desc,
 			TextSize = 10,
@@ -1281,7 +1400,62 @@ local function labelBlock(row, title, desc)
 		})
 		themed(descLabel, "TextColor3", "TextTertiary")
 	end
-	return block
+	return block, titleLabel, descLabel
+end
+
+-- Shared lifecycle every widget's returned control table gets, attached in one place instead of
+-- reimplemented per-`CreateXxx`: `SetVisible` (show/hide the whole row), `SetEnabled` (toggle baseRow's
+-- own DisabledOverlay — no per-widget disable logic needed), `SetName`/`SetDescription` (retarget whatever
+-- labelBlock built, lazily creating a description label if the widget started without one), `Destroy` (tear
+-- down just this one row, and drop it from `Library.Flags` if it was flagged, without touching the rest of
+-- the window). `descParent` is the container a lazily-created description label should be parented into
+-- (labelBlock's `block`, or nil for a widget with no label-block concept — Button/Label/Slider — in which
+-- case `SetDescription` is a documented no-op rather than a crash).
+local function attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, descParent, flagName)
+	control.SetVisible = function(_, visible)
+		row.Visible = visible
+	end
+	control.SetEnabled = function(_, enabled)
+		if disableOverlay then
+			disableOverlay.Visible = not enabled
+		end
+	end
+	control.SetName = function(_, name)
+		if titleLabel then
+			titleLabel.Text = name
+		end
+	end
+	control.SetDescription = function(_, desc)
+		if not descParent then
+			return
+		end
+		if desc and desc ~= "" then
+			if not descLabel or not descLabel.Parent then
+				descLabel = new("TextLabel", {
+					Font = Fonts.SubBody,
+					TextSize = 10,
+					TextColor3 = Colors.TextTertiary,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					BackgroundTransparency = 1,
+					Position = UDim2.fromOffset(0, 16),
+					Size = UDim2.new(1, 0, 0, 12),
+					Parent = descParent,
+				})
+				themed(descLabel, "TextColor3", "TextTertiary")
+			end
+			descLabel.Text = desc
+		elseif descLabel then
+			descLabel:Destroy()
+			descLabel = nil
+		end
+	end
+	control.Destroy = function()
+		if flagName and Library.Flags[flagName] == control then
+			Library.Flags[flagName] = nil
+		end
+		row:Destroy()
+	end
+	return control
 end
 
 -- Positions an Overlay-parented flyout (dropdown list, multi-dropdown list, color picker panel) relative
@@ -1313,7 +1487,7 @@ end
 
 function TabMeta:CreateLabel(config)
 	config = config or {}
-	local row = baseRow(self, 24)
+	local row, disableOverlay = baseRow(self, 24)
 	local label = new("TextLabel", {
 		Font = Fonts.Caption,
 		Text = config.Text or "",
@@ -1325,7 +1499,9 @@ function TabMeta:CreateLabel(config)
 		Parent = row,
 	})
 	themed(label, "TextColor3", "TextSecondary")
-	return row
+	-- A Label has no separate "name" concept — `SetName` retargets its own displayed text, same field
+	-- `config.Text` set it from. No description slot (it IS the text), so `SetDescription` is a no-op.
+	return attachLifecycle({}, row, disableOverlay, label, nil, nil, nil)
 end
 
 -- Groups related widgets under one titled card (e.g. "Theme", "Config") instead of them sitting as loose
@@ -1399,8 +1575,8 @@ function TabMeta:CreateToggle(config)
 	local default = config.CurrentValue == true
 	local callback = config.Callback or function() end
 
-	local row = baseRow(self, 40)
-	labelBlock(row, name, config.Description)
+	local row, disableOverlay = baseRow(self, 40)
+	local block, titleLabel, descLabel = labelBlock(row, name, config.Description)
 
 	local track = new("TextButton", {
 		Name = "Track",
@@ -1457,7 +1633,7 @@ function TabMeta:CreateToggle(config)
 	if config.Flag then
 		Library.Flags[config.Flag] = control
 	end
-	return control
+	return attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, block, config.Flag)
 end
 
 function TabMeta:CreateButton(config)
@@ -1465,7 +1641,7 @@ function TabMeta:CreateButton(config)
 	local name = config.Name or "Button"
 	local callback = config.Callback or function() end
 
-	local row = baseRow(self, 36)
+	local row, disableOverlay = baseRow(self, 36)
 	local btn = new("TextButton", {
 		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
@@ -1495,7 +1671,9 @@ function TabMeta:CreateButton(config)
 		task.spawn(callback)
 	end)
 
-	return row
+	-- A Button's "name" is its own centered label; no description slot (there's no room in a 36px button
+	-- row for one), so `SetDescription` is a documented no-op like Label's.
+	return attachLifecycle({}, row, disableOverlay, btnLabel, nil, nil, nil)
 end
 
 function TabMeta:CreateSlider(config)
@@ -1503,6 +1681,14 @@ function TabMeta:CreateSlider(config)
 	local name = config.Name or "Slider"
 	local min = config.Range and config.Range[1] or 0
 	local max = config.Range and config.Range[2] or 100
+	-- A reversed Range ({200, 16} instead of {16, 200}) used to crash outright: math.clamp requires
+	-- min <= max and errors otherwise, and `value = math.clamp(config.CurrentValue or min, min, max)` just
+	-- below is the very first thing this constructor does with them. Same defensive spirit as the
+	-- max==min/increment<=0 guards right after this (a bad-but-plausible config shouldn't crash the whole
+	-- widget) — swapping instead of erroring makes {200, 16} behave exactly like {16, 200}.
+	if min > max then
+		min, max = max, min
+	end
 	local increment = config.Increment or 1
 	-- unclamped CurrentValue used to render (and report to Callback) a value outside [min,max] until the
 	-- user's first drag silently pulled it back in line via setFromAlpha's own math.clamp — confirmed via
@@ -1521,7 +1707,7 @@ function TabMeta:CreateSlider(config)
 		return (v - min) / (max - min)
 	end
 
-	local row = baseRow(self, 46)
+	local row, disableOverlay = baseRow(self, 46)
 	local nameLabel = new("TextLabel", {
 		Font = Fonts.Body,
 		Text = name,
@@ -1588,8 +1774,15 @@ function TabMeta:CreateSlider(config)
 		Parent = track,
 	})
 
-	trackButton.MouseButton1Down:Connect(function()
+	-- A plain click (down+up with zero movement) used to do nothing at all — dragging only flipped a flag,
+	-- and the value only ever actually moved from InputChanged, which never fires without a mouse-move
+	-- frame in between. Every other slider convention jumps to the click position immediately; doing the
+	-- same here means `x`/`y` (GuiButton.MouseButton1Down's own params, screen pixels) feed straight into
+	-- the same alpha math InputChanged uses below instead of duplicating it.
+	trackButton.MouseButton1Down:Connect(function(x, y)
 		dragging = true
+		local relX = (x - track.AbsolutePosition.X) / track.AbsoluteSize.X
+		setFromAlpha(relX)
 	end)
 	trackConnection(UserInputService.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -1613,7 +1806,9 @@ function TabMeta:CreateSlider(config)
 	if config.Flag then
 		Library.Flags[config.Flag] = control
 	end
-	return control
+	-- Slider's layout (name + right-aligned value on one line, track below) has no labelBlock/description
+	-- slot to attach to — `SetName` retargets `nameLabel`, `SetDescription` is a documented no-op.
+	return attachLifecycle(control, row, disableOverlay, nameLabel, nil, nil, config.Flag)
 end
 
 function TabMeta:CreateDropdown(config)
@@ -1623,8 +1818,8 @@ function TabMeta:CreateDropdown(config)
 	local current = config.CurrentOption or options[1] or ""
 	local callback = config.Callback or function() end
 
-	local row = baseRow(self, 40)
-	labelBlock(row, name)
+	local row, disableOverlay = baseRow(self, 40)
+	local block, titleLabel, descLabel = labelBlock(row, name, config.Description)
 
 	local btn = new("TextButton", {
 		AnchorPoint = Vector2.new(1, 0.5),
@@ -1652,6 +1847,9 @@ function TabMeta:CreateDropdown(config)
 	local overlay = self.Window.Overlay
 	local sheet = overlay.Parent
 
+	-- mutable now (was a fixed local computed once from the initial `options`): `Refresh` below can change
+	-- the option count at any time, and the open/positioning code always needs the CURRENT height, not the
+	-- one captured at creation.
 	local listHeight = #options * 24
 	local list = new("Frame", {
 		Name = "OptionList",
@@ -1689,7 +1887,65 @@ function TabMeta:CreateDropdown(config)
 	end
 	onTheme(highlight) -- re-reads current Colors.AccentBlue/TextSecondary so idle (never-reopened) option colors refresh too
 
-	local function setOpen(value)
+	local setOpen -- forward-declared: rebuildOptions (below) needs to close-on-pick from inside its own click handlers
+
+	-- Builds (or rebuilds, for Refresh) every option button from the current `options` table. Pulled out of
+	-- the old inline creation loop so Refresh can call the exact same logic instead of duplicating it.
+	local function rebuildOptions()
+		for _, child in ipairs(list:GetChildren()) do
+			if child:IsA("GuiObject") then
+				child:Destroy()
+			end
+		end
+		optLabels = {}
+		listHeight = #options * 24
+		for i, option in ipairs(options) do
+			local opt = new("TextButton", {
+				Size = UDim2.new(1, 0, 0, 24),
+				BackgroundTransparency = 1,
+				Text = "",
+				LayoutOrder = i,
+				-- ZIndex is NOT inherited from parent in Roblox — `list` being ZIndex=10 does nothing for
+				-- this button's own input priority. Without this, `opt` defaulted to ZIndex=1, tying with
+				-- Test Button's own default-ZIndex TextButton. Global ZIndexBehavior breaks same-ZIndex ties
+				-- by creation order, which is why clicking "Noclip" was flaky: sometimes the option won,
+				-- sometimes Test Button won underneath it, sometimes both fired. Matching `list`'s ZIndex
+				-- here makes the option button unambiguously win over any row's default-ZIndex content.
+				ZIndex = 10,
+				Parent = list,
+			})
+			local optLabel = new("TextLabel", {
+				Font = Fonts.SubBody,
+				Text = option,
+				TextSize = 11,
+				TextColor3 = option == current and Colors.AccentBlue or Colors.TextSecondary,
+				BackgroundTransparency = 1,
+				Size = UDim2.fromScale(1, 1),
+				ZIndex = 11,
+				Parent = opt,
+			})
+			optLabels[option] = optLabel
+			opt.MouseButton1Click:Connect(function()
+				current = option
+				btnLabel.Text = option
+				setOpen(false)
+				highlight()
+				task.spawn(callback, current)
+			end)
+		end
+	end
+
+	-- Repositions the open flyout against `btn`'s LIVE position/size — connected below to both the anchor
+	-- button moving (dock collapse/expand, or any future layout change) and the sheet resizing (the drag-
+	-- to-resize corner handle). Without this, an open dropdown stayed anchored to wherever it was at open
+	-- time and visually detached from its own button the moment either changed underneath it.
+	local function reposition()
+		if open then
+			positionFlyout(sheet, btn, list, listHeight)
+		end
+	end
+
+	local function setOpenImpl(value)
 		if open == value then
 			return
 		end
@@ -1729,41 +1985,15 @@ function TabMeta:CreateDropdown(config)
 			end)
 		end
 	end
+	setOpen = setOpenImpl
 
-	for i, option in ipairs(options) do
-		local opt = new("TextButton", {
-			Size = UDim2.new(1, 0, 0, 24),
-			BackgroundTransparency = 1,
-			Text = "",
-			LayoutOrder = i,
-			-- ZIndex is NOT inherited from parent in Roblox — `list` being ZIndex=10 does nothing for
-			-- this button's own input priority. Without this, `opt` defaulted to ZIndex=1, tying with
-			-- Test Button's own default-ZIndex TextButton. Global ZIndexBehavior breaks same-ZIndex ties
-			-- by creation order, which is why clicking "Noclip" was flaky: sometimes the option won,
-			-- sometimes Test Button won underneath it, sometimes both fired. Matching `list`'s ZIndex
-			-- here makes the option button unambiguously win over any row's default-ZIndex content.
-			ZIndex = 10,
-			Parent = list,
-		})
-		local optLabel = new("TextLabel", {
-			Font = Fonts.SubBody,
-			Text = option,
-			TextSize = 11,
-			TextColor3 = option == current and Colors.AccentBlue or Colors.TextSecondary,
-			BackgroundTransparency = 1,
-			Size = UDim2.fromScale(1, 1),
-			ZIndex = 11,
-			Parent = opt,
-		})
-		optLabels[option] = optLabel
-		opt.MouseButton1Click:Connect(function()
-			current = option
-			btnLabel.Text = option
-			setOpen(false)
-			highlight()
-			task.spawn(callback, current)
-		end)
-	end
+	rebuildOptions()
+	-- `btn`'s own connection auto-disconnects when `row` (its parent) is destroyed, same as every other
+	-- Instance-level connection in this file — but `list` lives in `Overlay`, NOT under `row`, so the
+	-- `sheet` connection wouldn't: it's rooted on the WINDOW's own Sheet, which outlives this one widget.
+	-- Captured so this control's overridden `Destroy` below can disconnect it explicitly.
+	btn:GetPropertyChangedSignal("AbsolutePosition"):Connect(reposition)
+	local sheetResizeConn = sheet:GetPropertyChangedSignal("AbsoluteSize"):Connect(reposition)
 
 	btn.MouseButton1Click:Connect(function()
 		setOpen(not open)
@@ -1788,9 +2018,42 @@ function TabMeta:CreateDropdown(config)
 		Get = function()
 			return current
 		end,
+		-- Rebuilds the option list from a new Options array — previously the only way to change what a
+		-- dropdown could show was destroying and recreating the whole widget. If `current` isn't in the new
+		-- list, falls back to the new first option (or "" for an empty list) rather than silently keeping a
+		-- now-invalid selection nothing in the rebuilt list would highlight or accept via Set.
+		Refresh = function(_, newOptions)
+			options = newOptions or {}
+			-- Membership check MUST run against the REBUILT optLabels, not the stale pre-refresh one — checking
+			-- first (against the old table, still keyed by the OLD options) let a `current` that used to be
+			-- valid silently survive a refresh that actually dropped it, since the old table still said "yes,
+			-- I recognize this" right up until rebuildOptions() replaced it. Caught live: refreshing away from
+			-- an option that was "current" kept displaying it as selected in a list that no longer contained it.
+			rebuildOptions()
+			if not optLabels[current] then
+				current = options[1] or ""
+			end
+			btnLabel.Text = current
+			highlight()
+			if open then
+				positionFlyout(sheet, btn, list, listHeight)
+				tween(list, Motion.Tab, { Size = UDim2.fromOffset(96, listHeight) })
+			end
+		end,
 	}
 	if config.Flag then
 		Library.Flags[config.Flag] = control
+	end
+	attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, block, config.Flag)
+	-- Overridden, not just inherited: the base Destroy only tears down `row` — `list` lives in `Overlay`
+	-- (never a child of `row`, by design — see its own creation comment above), so it needs its own
+	-- explicit cleanup, and so does the one connection rooted on the window's `sheet` instead of on
+	-- anything under this row.
+	local baseDestroy = control.Destroy
+	control.Destroy = function()
+		sheetResizeConn:Disconnect()
+		list:Destroy()
+		baseDestroy()
 	end
 	return control
 end
@@ -1804,8 +2067,8 @@ function TabMeta:CreateInput(config)
 	local clearOnFocus = config.ClearOnFocus == true
 	local callback = config.Callback or function() end
 
-	local row = baseRow(self, 40)
-	labelBlock(row, name)
+	local row, disableOverlay = baseRow(self, 40)
+	local block, titleLabel, descLabel = labelBlock(row, name, config.Description)
 
 	local box = new("TextBox", {
 		AnchorPoint = Vector2.new(1, 0.5),
@@ -1828,10 +2091,26 @@ function TabMeta:CreateInput(config)
 	stroke(box, 0.85, 1)
 	pad(box, nil, 0, 8, 0, 8)
 
+	-- last known-good value for NumbersOnly's revert-on-invalid path below. Starts at `default` since
+	-- that's what's actually sitting in the box before the user touches it.
+	local lastValidNumberText = default
+
 	local function commit(fireCallback)
 		local v = box.Text
 		if numbersOnly then
-			v = v:gsub("[^%-%.%d]", "")
+			-- Character-filtering alone (stripping anything that isn't a digit/dot/minus) still let
+			-- structurally-broken text through — "1.2.3", "--5", "5-", ".", "-" all survive a gsub filter
+			-- one character at a time, since every individual character in them IS allowed. Actually
+			-- parsing with tonumber() after filtering is the only way to catch that; on failure, revert to
+			-- the last text that DID parse, same "snap back to the last valid state" idiom the color
+			-- picker's hex box already uses for its own invalid-input case.
+			local filtered = v:gsub("[^%-%.%d]", "")
+			if filtered ~= "" and tonumber(filtered) then
+				v = filtered
+				lastValidNumberText = v
+			else
+				v = lastValidNumberText
+			end
 			box.Text = v
 		end
 		if fireCallback then
@@ -1855,7 +2134,7 @@ function TabMeta:CreateInput(config)
 	if config.Flag then
 		Library.Flags[config.Flag] = control
 	end
-	return control
+	return attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, block, config.Flag)
 end
 
 function TabMeta:CreateKeybind(config)
@@ -1884,8 +2163,8 @@ function TabMeta:CreateKeybind(config)
 
 	local currentKey = safeKeyCode(config.CurrentKeybind)
 
-	local row = baseRow(self, 40)
-	labelBlock(row, name)
+	local row, disableOverlay = baseRow(self, 40)
+	local block, titleLabel, descLabel = labelBlock(row, name, config.Description)
 
 	local btn = new("TextButton", {
 		AnchorPoint = Vector2.new(1, 0.5),
@@ -1948,6 +2227,13 @@ function TabMeta:CreateKeybind(config)
 		Set = function(_, keyName)
 			currentKey = safeKeyCode(keyName)
 			btnLabel.Text = currentKey and currentKey.Name or "None"
+			-- Was silently missing: a manual rebind through the UI fired `changedCallback` (see the
+			-- InputBegan listener above), but `Set()` — which is what `LoadConfig` calls — didn't, so a
+			-- host script relying on ChangedCallback to know "the bind identity changed" (e.g. to update a
+			-- hint label elsewhere) never heard about a config-restored bind. Deliberately still NOT firing
+			-- the main `callback` here (that's the "hotkey was pressed" action-trigger — firing it from a
+			-- config load would misfire the action itself), only the identity-change notification.
+			task.spawn(changedCallback, currentKey and currentKey.Name or nil)
 		end,
 		Get = function()
 			return currentKey and currentKey.Name or nil
@@ -1956,7 +2242,7 @@ function TabMeta:CreateKeybind(config)
 	if config.Flag then
 		Library.Flags[config.Flag] = control
 	end
-	return control
+	return attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, block, config.Flag)
 end
 
 -- Named config save/load UI on top of Library:SaveConfig/LoadConfig/ListConfigs/DeleteConfig. Doesn't
@@ -2105,6 +2391,7 @@ function TabMeta:CreateConfigManager(config)
 
 	local open = false
 	local setOpen -- forward-declared; rebuildRows (below) needs to call it to close-on-pick
+	local currentHeight = 0 -- last height rebuildRows computed; `reposition` below needs it outside setOpen's own scope
 
 	local function rebuildRows()
 		for _, child in ipairs(list:GetChildren()) do
@@ -2176,9 +2463,9 @@ function TabMeta:CreateConfigManager(config)
 				-- refresh in place (keep the flyout open so deleting several in a row works), and resize/
 				-- reposition to match — a discarded rebuildRows() height here previously left the flyout's
 				-- own Size stale against its new row count (caught live, see SESSION_NOTES.md).
-				local newHeight = rebuildRows()
-				positionFlyout(sheet, selectBtn, list, newHeight)
-				tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, newHeight) })
+				currentHeight = rebuildRows()
+				positionFlyout(sheet, selectBtn, list, currentHeight)
+				tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, currentHeight) })
 			end)
 		end
 		if #names == 0 then
@@ -2215,10 +2502,10 @@ function TabMeta:CreateConfigManager(config)
 					setOpen(false)
 				end
 			end
-			local listHeight = rebuildRows()
-			positionFlyout(sheet, selectBtn, list, listHeight)
+			currentHeight = rebuildRows()
+			positionFlyout(sheet, selectBtn, list, currentHeight)
 			list.Visible = true
-			tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, listHeight), BackgroundTransparency = 0 })
+			tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, currentHeight), BackgroundTransparency = 0 })
 		else
 			local closeTween = tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, 0), BackgroundTransparency = 1 })
 			closeTween.Completed:Connect(function(state)
@@ -2228,6 +2515,19 @@ function TabMeta:CreateConfigManager(config)
 			end)
 		end
 	end
+
+	-- same live-reposition fix as Dropdown/MultiDropdown/ColorPicker: without this, an open saved-config
+	-- flyout stayed anchored to wherever it was at open-time and drifted from `selectBtn` the moment the
+	-- dock collapsed/expanded or the window got resized underneath it.
+	local function reposition()
+		if open then
+			positionFlyout(sheet, selectBtn, list, currentHeight)
+		end
+	end
+	selectBtn:GetPropertyChangedSignal("AbsolutePosition"):Connect(reposition)
+	-- captured (unlike selectBtn's own connection, which auto-disconnects with `loadRow`) so Destroy below
+	-- can drop it explicitly — it's rooted on the window's `sheet`, which outlives this one widget.
+	local sheetResizeConn = sheet:GetPropertyChangedSignal("AbsoluteSize"):Connect(reposition)
 
 	selectBtn.MouseButton1Click:Connect(function()
 		setOpen(not open)
@@ -2248,7 +2548,23 @@ function TabMeta:CreateConfigManager(config)
 		task.spawn(callback, "load", selected, ok, err)
 	end)
 
-	return { Refresh = rebuildRows }
+	-- No SetEnabled/SetName here — this is a two-row action panel with no single value or label to point
+	-- either at (unlike every other widget, which is exactly one row with one name). SetVisible/Destroy
+	-- still make sense (and are cheap), just applied to both rows instead of a labelBlock/disableOverlay
+	-- this widget never built.
+	return {
+		Refresh = rebuildRows,
+		SetVisible = function(_, visible)
+			saveRow.Visible = visible
+			loadRow.Visible = visible
+		end,
+		Destroy = function()
+			sheetResizeConn:Disconnect()
+			saveRow:Destroy()
+			loadRow:Destroy()
+			list:Destroy()
+		end,
+	}
 end
 
 function TabMeta:CreateMultiDropdown(config)
@@ -2261,8 +2577,8 @@ function TabMeta:CreateMultiDropdown(config)
 	end
 	local callback = config.Callback or function() end
 
-	local row = baseRow(self, 40)
-	labelBlock(row, name)
+	local row, disableOverlay = baseRow(self, 40)
+	local block, titleLabel, descLabel = labelBlock(row, name, config.Description)
 
 	local btn = new("TextButton", {
 		AnchorPoint = Vector2.new(1, 0.5),
@@ -2302,6 +2618,8 @@ function TabMeta:CreateMultiDropdown(config)
 	local overlay = self.Window.Overlay
 	local sheet = overlay.Parent
 
+	-- mutable now, same reason as CreateDropdown's own `listHeight`: `Refresh` below can change the option
+	-- count at any time.
 	local listHeight = #options * 24
 	local list = new("Frame", {
 		Name = "OptionList",
@@ -2323,8 +2641,80 @@ function TabMeta:CreateMultiDropdown(config)
 
 	local checks = {}
 	local open = false
+	local setOpen -- forward-declared: rebuildOptions (below) needs it for the theme listener below to stay valid across a Refresh
 
-	local function setOpen(value)
+	-- Builds (or rebuilds, for Refresh) every checkbox row from the current `options`/`selected` tables —
+	-- same pull-out-of-the-creation-loop treatment as CreateDropdown's own rebuildOptions, for the same reason.
+	local function rebuildOptions()
+		for _, child in ipairs(list:GetChildren()) do
+			if child:IsA("GuiObject") then
+				child:Destroy()
+			end
+		end
+		checks = {}
+		listHeight = #options * 24
+		for i, option in ipairs(options) do
+			local opt = new("TextButton", {
+				Size = UDim2.new(1, 0, 0, 24),
+				BackgroundTransparency = 1,
+				Text = "",
+				LayoutOrder = i,
+				-- see CreateDropdown's `opt` for why this must be explicit and match `list` (bug #9): ZIndex
+				-- is never inherited from parent in Roblox, so this would otherwise default to 1 and tie with
+				-- whatever row-content sits behind the flyout.
+				ZIndex = 10,
+				Parent = list,
+			})
+			local check = new("Frame", {
+				Name = "Check",
+				AnchorPoint = Vector2.new(0, 0.5),
+				Position = UDim2.new(0, 8, 0.5, 0),
+				Size = UDim2.fromOffset(14, 14),
+				BackgroundColor3 = selected[option] and Colors.AccentBlue or Colors.BgFrame,
+				ZIndex = 11,
+				Parent = opt,
+			})
+			corner(check, 4)
+			stroke(check, 0.7, 1)
+			local optLabel = new("TextLabel", {
+				Font = Fonts.SubBody,
+				Text = option,
+				TextSize = 11,
+				TextColor3 = Colors.TextSecondary,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				BackgroundTransparency = 1,
+				Position = UDim2.fromOffset(28, 0),
+				Size = UDim2.new(1, -32, 1, 0),
+				ZIndex = 11,
+				Parent = opt,
+			})
+			themed(optLabel, "TextColor3", "TextSecondary")
+			checks[option] = check
+			opt.MouseButton1Click:Connect(function()
+				selected[option] = not selected[option]
+				tween(check, Motion.Tab, { BackgroundColor3 = selected[option] and Colors.AccentBlue or Colors.BgFrame })
+				refreshLabel()
+				local result = {}
+				for _, o in ipairs(options) do
+					if selected[o] then
+						table.insert(result, o)
+					end
+				end
+				task.spawn(callback, result)
+			end)
+		end
+	end
+
+	-- same live-reposition fix as CreateDropdown: without this, an open MultiDropdown list stayed anchored
+	-- to wherever it was at open-time and drifted from `btn` the moment the dock collapsed/expanded or the
+	-- window resized underneath it.
+	local function reposition()
+		if open then
+			positionFlyout(sheet, btn, list, listHeight)
+		end
+	end
+
+	setOpen = function(value)
 		if open == value then
 			return
 		end
@@ -2353,56 +2743,12 @@ function TabMeta:CreateMultiDropdown(config)
 		end
 	end
 
-	for i, option in ipairs(options) do
-		local opt = new("TextButton", {
-			Size = UDim2.new(1, 0, 0, 24),
-			BackgroundTransparency = 1,
-			Text = "",
-			LayoutOrder = i,
-			-- see CreateDropdown's `opt` for why this must be explicit and match `list` (bug #9): ZIndex
-			-- is never inherited from parent in Roblox, so this would otherwise default to 1 and tie with
-			-- whatever row-content sits behind the flyout.
-			ZIndex = 10,
-			Parent = list,
-		})
-		local check = new("Frame", {
-			Name = "Check",
-			AnchorPoint = Vector2.new(0, 0.5),
-			Position = UDim2.new(0, 8, 0.5, 0),
-			Size = UDim2.fromOffset(14, 14),
-			BackgroundColor3 = selected[option] and Colors.AccentBlue or Colors.BgFrame,
-			ZIndex = 11,
-			Parent = opt,
-		})
-		corner(check, 4)
-		stroke(check, 0.7, 1)
-		local optLabel = new("TextLabel", {
-			Font = Fonts.SubBody,
-			Text = option,
-			TextSize = 11,
-			TextColor3 = Colors.TextSecondary,
-			TextXAlignment = Enum.TextXAlignment.Left,
-			BackgroundTransparency = 1,
-			Position = UDim2.fromOffset(28, 0),
-			Size = UDim2.new(1, -32, 1, 0),
-			ZIndex = 11,
-			Parent = opt,
-		})
-		themed(optLabel, "TextColor3", "TextSecondary")
-		checks[option] = check
-		opt.MouseButton1Click:Connect(function()
-			selected[option] = not selected[option]
-			tween(check, Motion.Tab, { BackgroundColor3 = selected[option] and Colors.AccentBlue or Colors.BgFrame })
-			refreshLabel()
-			local result = {}
-			for _, o in ipairs(options) do
-				if selected[o] then
-					table.insert(result, o)
-				end
-			end
-			task.spawn(callback, result)
-		end)
-	end
+	rebuildOptions()
+	-- see CreateDropdown's identical comment: `btn`'s connection dies with `row`, `sheet`'s doesn't (it's
+	-- rooted on the window, not this widget) — captured for this control's overridden Destroy below.
+	btn:GetPropertyChangedSignal("AbsolutePosition"):Connect(reposition)
+	local sheetResizeConn = sheet:GetPropertyChangedSignal("AbsoluteSize"):Connect(reposition)
+
 	onTheme(function()
 		for option, check in pairs(checks) do
 			check.BackgroundColor3 = selected[option] and Colors.AccentBlue or Colors.BgFrame
@@ -2445,9 +2791,38 @@ function TabMeta:CreateMultiDropdown(config)
 			task.spawn(callback, getSelected())
 		end,
 		Get = getSelected,
+		-- Rebuilds the checkbox list from a new Options array, same idea as Dropdown's Refresh — dropping
+		-- any current selections that aren't in the new list rather than leaving them silently checked
+		-- but invisible/unreachable in the rebuilt list.
+		Refresh = function(_, newOptions)
+			options = newOptions or {}
+			local stillValid = {}
+			for _, o in ipairs(options) do
+				stillValid[o] = true
+			end
+			for o in pairs(selected) do
+				if not stillValid[o] then
+					selected[o] = nil
+				end
+			end
+			rebuildOptions()
+			refreshLabel()
+			if open then
+				positionFlyout(sheet, btn, list, listHeight)
+				tween(list, Motion.Tab, { Size = UDim2.fromOffset(140, listHeight) })
+			end
+		end,
 	}
 	if config.Flag then
 		Library.Flags[config.Flag] = control
+	end
+	attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, block, config.Flag)
+	-- same override as CreateDropdown, same reason: `list` lives in `Overlay`, not under `row`.
+	local baseDestroy = control.Destroy
+	control.Destroy = function()
+		sheetResizeConn:Disconnect()
+		list:Destroy()
+		baseDestroy()
 	end
 	return control
 end
@@ -2458,8 +2833,8 @@ function TabMeta:CreateColorPicker(config)
 	local default = config.CurrentColor or Color3.fromRGB(255, 255, 255)
 	local callback = config.Callback or function() end
 
-	local row = baseRow(self, 40)
-	labelBlock(row, name)
+	local row, disableOverlay = baseRow(self, 40)
+	local block, titleLabel, descLabel = labelBlock(row, name, config.Description)
 
 	local swatch = new("TextButton", {
 		AnchorPoint = Vector2.new(1, 0.5),
@@ -2702,6 +3077,20 @@ function TabMeta:CreateColorPicker(config)
 			end)
 		end
 	end
+
+	-- same live-reposition fix as Dropdown/MultiDropdown/ConfigManager: without this, an open color panel
+	-- stayed anchored to wherever it was at open-time and drifted from `swatch` the moment the dock
+	-- collapsed/expanded or the window resized underneath it.
+	local function reposition()
+		if open then
+			positionFlyout(sheet, swatch, panel, panelSize.Y)
+		end
+	end
+	swatch:GetPropertyChangedSignal("AbsolutePosition"):Connect(reposition)
+	-- see CreateDropdown's identical comment: captured so this control's overridden Destroy can drop it —
+	-- it's rooted on the window's `sheet`, not on anything that dies with `row`.
+	local sheetResizeConn = sheet:GetPropertyChangedSignal("AbsoluteSize"):Connect(reposition)
+
 	swatch.MouseButton1Click:Connect(function()
 		setOpen(not open)
 	end)
@@ -2721,6 +3110,15 @@ function TabMeta:CreateColorPicker(config)
 	}
 	if config.Flag then
 		Library.Flags[config.Flag] = control
+	end
+	attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, block, config.Flag)
+	-- same override as CreateDropdown/CreateMultiDropdown, same reason: `panel` lives in `Overlay`, not
+	-- under `row`.
+	local baseDestroy = control.Destroy
+	control.Destroy = function()
+		sheetResizeConn:Disconnect()
+		panel:Destroy()
+		baseDestroy()
 	end
 	return control
 end
