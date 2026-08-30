@@ -159,6 +159,30 @@ local function themed(inst, prop, key)
 	return inst
 end
 
+-- Every `UserInputService.Input*:Connect` in this file (window drag, floating-button drag, slider drag,
+-- keybind listener, color picker drag) is service-level, not tied to any per-widget Instance — destroying
+-- the widget/window that created one does NOT disconnect it, since `UserInputService` itself outlives
+-- everything. Left unaddressed, re-running `CreateWindow` (which this project's own dev loop does
+-- constantly) stacks a brand new set of these on every run: a keybind fires once per stacked connection,
+-- every drag delta applies once per stacked connection, etc. `trackConnection` records every one of them
+-- so `CreateWindow` (see below) can disconnect the previous run's entire set before building a new one —
+-- consistent with this library's existing "re-running CreateWindow replaces, never stacks" design intent.
+local GlobalConnections = {}
+
+local function trackConnection(conn)
+	table.insert(GlobalConnections, conn)
+	return conn
+end
+
+local function clearGlobalConnections()
+	for _, conn in ipairs(GlobalConnections) do
+		pcall(function()
+			conn:Disconnect()
+		end)
+	end
+	GlobalConnections = {}
+end
+
 -- ================= ICONS (vector, zero-asset) =================
 
 local function iconCanvas(parent)
@@ -481,6 +505,16 @@ end
 function Library:DeleteConfig(name)
 	name = sanitizeConfigName(name or "")
 	local path = Library.ConfigFolder .. "/" .. name .. ".json"
+	-- Some executors' delfile silently no-ops on a path that was never there instead of erroring, which
+	-- used to let this function claim `true` (success) for a delete that never happened. Checking isfile
+	-- first makes the return value actually mean "something was deleted" — if isfile itself isn't
+	-- available (checkOk false), fall through to the old behavior rather than blocking the delete attempt.
+	local checkOk, existed = pcall(function()
+		return isfile(path)
+	end)
+	if checkOk and not existed then
+		return false, "no such config: " .. name
+	end
 	local ok, err = pcall(function()
 		delfile(path)
 	end)
@@ -631,6 +665,19 @@ function Library:CreateWindow(config)
 			child:Destroy() -- re-running CreateWindow (e.g. re-executing the script) replaces, never stacks
 		end
 	end
+
+	-- The three lines below make that same "replaces, never stacks" promise actually hold for everything
+	-- that ISN'T a child Instance (so `:Destroy()` above doesn't touch it): the previous run's global
+	-- UserInputService connections (window/float-button drag, slider drag, keybind listener, color picker
+	-- drag — all service-level, survive their own widget's destruction otherwise), the previous run's
+	-- ThemeListeners closures (grow forever otherwise — `themed()`/`onTheme` never prune on their own), and
+	-- the previous run's Flags (a flag not reused by the new window would otherwise sit forever pointing at
+	-- destroyed widgets, polluting SaveConfig's output). Confirmed via code review this session (bug batch
+	-- from an external review) that re-executing the script repeatedly — this project's own normal dev
+	-- loop — was stacking all three without this.
+	clearGlobalConnections()
+	ThemeListeners = {}
+	self.Flags = {}
 
 	local screenGui = new("ScreenGui", {
 		Name = "IOSRobloxUILib",
@@ -791,17 +838,17 @@ function Library:CreateWindow(config)
 				startPos = sheet.Position
 			end
 		end)
-		UserInputService.InputEnded:Connect(function(input)
+		trackConnection(UserInputService.InputEnded:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 				dragging = false
 			end
-		end)
-		UserInputService.InputChanged:Connect(function(input)
+		end))
+		trackConnection(UserInputService.InputChanged:Connect(function(input)
 			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
 				local delta = input.Position - dragStart
 				sheet.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
 			end
-		end)
+		end))
 	end
 
 	local pages = new("Frame", {
@@ -957,7 +1004,7 @@ function Library:CreateWindow(config)
 				startPos = floatBtn.Position
 			end
 		end)
-		UserInputService.InputChanged:Connect(function(input)
+		trackConnection(UserInputService.InputChanged:Connect(function(input)
 			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
 				local delta = input.Position - dragStart
 				if not moved and delta.Magnitude > DRAG_THRESHOLD then
@@ -965,15 +1012,15 @@ function Library:CreateWindow(config)
 				end
 				floatBtn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
 			end
-		end)
-		UserInputService.InputEnded:Connect(function(input)
+		end))
+		trackConnection(UserInputService.InputEnded:Connect(function(input)
 			if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
 				dragging = false
 				if not moved then
 					requestToggle()
 				end
 			end
-		end)
+		end))
 	end
 
 	local Window = setmetatable({
@@ -1400,8 +1447,22 @@ function TabMeta:CreateSlider(config)
 	local min = config.Range and config.Range[1] or 0
 	local max = config.Range and config.Range[2] or 100
 	local increment = config.Increment or 1
-	local value = config.CurrentValue or min
+	-- unclamped CurrentValue used to render (and report to Callback) a value outside [min,max] until the
+	-- user's first drag silently pulled it back in line via setFromAlpha's own math.clamp — confirmed via
+	-- code review (external bug report) that the visible starting state and the actual range could
+	-- disagree. Clamping here makes the initial render always agree with the widget's own valid range.
+	local value = math.clamp(config.CurrentValue or min, min, max)
 	local callback = config.Callback or function() end
+
+	-- `max == min` divides by zero below (both in the initial fill size and in every setFromAlpha call);
+	-- `toAlpha` maps that degenerate range to a fixed 0 instead of propagating a NaN into UDim2.fromScale,
+	-- which errors outright. A single-value Range is a plausible (if odd) config, not worth crashing over.
+	local function toAlpha(v)
+		if max == min then
+			return 0
+		end
+		return (v - min) / (max - min)
+	end
 
 	local row = baseRow(self, 46)
 	local nameLabel = new("TextLabel", {
@@ -1439,7 +1500,7 @@ function TabMeta:CreateSlider(config)
 	corner(track, Radius.Pill)
 
 	local fill = new("Frame", {
-		Size = UDim2.fromScale((value - min) / (max - min), 1),
+		Size = UDim2.fromScale(toAlpha(value), 1),
 		BackgroundColor3 = Colors.AccentBlue,
 		Parent = track,
 	})
@@ -1449,8 +1510,13 @@ function TabMeta:CreateSlider(config)
 	local function setFromAlpha(alpha)
 		alpha = math.clamp(alpha, 0, 1)
 		local raw = min + (max - min) * alpha
-		value = math.clamp(math.floor(raw / increment + 0.5) * increment, min, max)
-		local drawAlpha = (value - min) / (max - min)
+		-- `increment <= 0` divides by zero on every single drag frame (not just at creation, unlike
+		-- min==max above) — falls back to an unquantized/continuous value instead of erroring, which is
+		-- the closest sane behavior to "no snapping" for a bad or zero increment.
+		value = increment > 0
+			and math.clamp(math.floor(raw / increment + 0.5) * increment, min, max)
+			or math.clamp(raw, min, max)
+		local drawAlpha = toAlpha(value)
 		tween(fill, Motion.Press, { Size = UDim2.fromScale(drawAlpha, 1) })
 		valueLabel.Text = tostring(value)
 		task.spawn(callback, value)
@@ -1468,20 +1534,20 @@ function TabMeta:CreateSlider(config)
 	trackButton.MouseButton1Down:Connect(function()
 		dragging = true
 	end)
-	UserInputService.InputEnded:Connect(function(input)
+	trackConnection(UserInputService.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			dragging = false
 		end
-	end)
-	UserInputService.InputChanged:Connect(function(input)
+	end))
+	trackConnection(UserInputService.InputChanged:Connect(function(input)
 		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
 			local relX = (input.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X
 			setFromAlpha(relX)
 		end
-	end)
+	end))
 	local control = {
 		Set = function(_, v)
-			setFromAlpha((v - min) / (max - min))
+			setFromAlpha(toAlpha(v))
 		end,
 		Get = function()
 			return value
@@ -1648,6 +1714,15 @@ function TabMeta:CreateDropdown(config)
 
 	local control = {
 		Set = function(_, option)
+			-- `optLabels` is already keyed by every valid option string (built above alongside the option
+			-- buttons), so it doubles as a membership check for free. Without this, Set silently accepted
+			-- any string at all — e.g. a config saved by an older script version with a different Options
+			-- list would display a value that isn't actually selectable or highlighted anywhere in the
+			-- list, and a callback written as `if v == "A" then ... elseif v == "B" then ...` would just
+			-- silently fall through for it.
+			if not optLabels[option] then
+				return
+			end
 			current = option
 			btnLabel.Text = option
 			highlight()
@@ -1731,7 +1806,26 @@ function TabMeta:CreateKeybind(config)
 	local name = config.Name or "Keybind"
 	local callback = config.Callback or function() end
 	local changedCallback = config.ChangedCallback or function() end
-	local currentKey = config.CurrentKeybind and Enum.KeyCode[config.CurrentKeybind] or nil
+
+	-- Indexing Enum.KeyCode with a name that isn't a real member THROWS (not a nil return) — a typo'd
+	-- `CurrentKeybind`, or a saved config left over from a renamed/removed KeyCode, would otherwise crash
+	-- CreateKeybind outright at creation time. (LoadConfig's own call into `Set` below is already pcall-
+	-- wrapped and would have failed soft either way — this specifically protects direct construction and
+	-- direct `:Set()` calls, which aren't wrapped by anything.)
+	local function safeKeyCode(keyName)
+		if not keyName then
+			return nil
+		end
+		local ok, key = pcall(function()
+			return Enum.KeyCode[keyName]
+		end)
+		if ok then
+			return key
+		end
+		return nil
+	end
+
+	local currentKey = safeKeyCode(config.CurrentKeybind)
 
 	local row = baseRow(self, 40)
 	labelBlock(row, name)
@@ -1772,7 +1866,7 @@ function TabMeta:CreateKeybind(config)
 	-- global listener: while `listening`, the next key press sets the bind (Escape cancels without
 	-- setting); otherwise, a press matching `currentKey` fires the bound callback. `gameProcessed` is
 	-- checked only for the fire path so binding capture still works even over a focused chat box etc.
-	UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	trackConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		if listening then
 			if input.UserInputType ~= Enum.UserInputType.Keyboard then
 				return
@@ -1791,11 +1885,11 @@ function TabMeta:CreateKeybind(config)
 		if not gameProcessed and currentKey and input.KeyCode == currentKey then
 			task.spawn(callback)
 		end
-	end)
+	end))
 
 	local control = {
 		Set = function(_, keyName)
-			currentKey = keyName and Enum.KeyCode[keyName] or nil
+			currentKey = safeKeyCode(keyName)
 			btnLabel.Text = currentKey and currentKey.Name or "None"
 		end,
 		Get = function()
@@ -2262,8 +2356,22 @@ function TabMeta:CreateMultiDropdown(config)
 		setOpen(not open)
 	end)
 
+	local function getSelected()
+		local result = {}
+		for _, o in ipairs(options) do
+			if selected[o] then
+				table.insert(result, o)
+			end
+		end
+		return result
+	end
+
 	local control = {
 		Set = function(_, optionsList)
+			-- `optionsList = optionsList or {}`: a nil argument (e.g. "clear every selection") used to
+			-- crash outright — `ipairs(nil)` throws, it doesn't just iterate zero times. Treating nil as
+			-- an empty list makes "select none" an actual supported call instead of a footgun.
+			optionsList = optionsList or {}
 			for k in pairs(selected) do
 				selected[k] = nil
 			end
@@ -2274,16 +2382,12 @@ function TabMeta:CreateMultiDropdown(config)
 				check.BackgroundColor3 = selected[option] and Colors.AccentBlue or Colors.BgFrame
 			end
 			refreshLabel()
+			-- was silently missing: LoadConfig restoring a saved ESP-style selection updated the
+			-- checkboxes/label but never told the host script to actually re-apply the effect — the exact
+			-- same class of bug already fixed for Toggle earlier in this project (see SESSION_NOTES.md).
+			task.spawn(callback, getSelected())
 		end,
-		Get = function()
-			local result = {}
-			for _, o in ipairs(options) do
-				if selected[o] then
-					table.insert(result, o)
-				end
-			end
-			return result
-		end,
+		Get = getSelected,
 	}
 	if config.Flag then
 		Library.Flags[config.Flag] = control
@@ -2479,13 +2583,13 @@ function TabMeta:CreateColorPicker(config)
 		hueDragging = true
 		updateHue(Vector2.new(x, y))
 	end)
-	UserInputService.InputEnded:Connect(function(input)
+	trackConnection(UserInputService.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			svDragging = false
 			hueDragging = false
 		end
-	end)
-	UserInputService.InputChanged:Connect(function(input)
+	end))
+	trackConnection(UserInputService.InputChanged:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
 			if svDragging then
 				updateSV(input.Position)
@@ -2493,7 +2597,7 @@ function TabMeta:CreateColorPicker(config)
 				updateHue(input.Position)
 			end
 		end
-	end)
+	end))
 
 	hexBox.FocusLost:Connect(function()
 		local hexStr = hexBox.Text:gsub("#", "")
@@ -2549,6 +2653,10 @@ function TabMeta:CreateColorPicker(config)
 		Set = function(_, color)
 			hue, sat, val = color:ToHSV()
 			updateVisuals()
+			-- was silently missing: LoadConfig restoring a saved color updated the swatch/panel but never
+			-- told the host script to actually re-apply it (e.g. an aura's real color never changed) — same
+			-- class of bug as MultiDropdown's Set above, and the one already fixed for Toggle previously.
+			task.spawn(callback, currentColor())
 		end,
 		Get = function()
 			return currentColor()
