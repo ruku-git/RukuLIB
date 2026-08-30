@@ -26,6 +26,7 @@
 	Library:SaveConfig("default") -- writes every Flag'd control's current value to IOSRobloxUILib_Configs/default.json
 	Library:LoadConfig("default") -- reads it back and re-applies (fires each control's Callback too)
 	Window:ToggleVisible() -- show/hide the whole window; also driven by the draggable floating button and any Keybind wired to it
+	Library:Destroy() -- or Window:Destroy() — full teardown: connections, ThemeListeners, Flags, the GUI itself
 ]]
 
 local TweenService = game:GetService("TweenService")
@@ -167,20 +168,48 @@ end
 -- every drag delta applies once per stacked connection, etc. `trackConnection` records every one of them
 -- so `CreateWindow` (see below) can disconnect the previous run's entire set before building a new one —
 -- consistent with this library's existing "re-running CreateWindow replaces, never stacks" design intent.
-local GlobalConnections = {}
+--
+-- A plain `local` here only covers CreateWindow being called twice against the SAME loaded Library
+-- instance — it does nothing for the far more common case of the whole script being re-executed from
+-- scratch (pressing "Execute" again), since a fresh `loadstring(...)()` call creates a brand new chunk
+-- with its own empty `GlobalConnections`, with no Lua-level reference back to the PREVIOUS execution's
+-- connections at all. Those old connections don't care that the script that made them is gone, though —
+-- they live on UserInputService's own signal, not in anything the new execution can reach or garbage-
+-- collect. `getgenv()` (a standard executor API for exactly this: state that survives a fresh script load,
+-- unlike ordinary Lua locals/globals) lets a new execution find and disconnect the previous one's list.
+-- Falls back to a plain local (same as before) on an executor without `getgenv()` — same-instance cleanup
+-- still works, cross-execution cleanup just can't.
+local genvOk, genv = pcall(getgenv)
+if not genvOk or type(genv) ~= "table" then
+	genv = {}
+end
+if genv.__IOSRobloxUILibConnections then
+	for _, conn in ipairs(genv.__IOSRobloxUILibConnections) do
+		pcall(function()
+			conn:Disconnect()
+		end)
+	end
+end
+genv.__IOSRobloxUILibConnections = {}
+local GlobalConnections = genv.__IOSRobloxUILibConnections
 
 local function trackConnection(conn)
 	table.insert(GlobalConnections, conn)
 	return conn
 end
 
+-- Clears IN PLACE (never rebinds `GlobalConnections` to a new table) so the local upvalue and
+-- `genv.__IOSRobloxUILibConnections` stay the exact same table for the rest of this execution's lifetime —
+-- a rebind here would silently break the cross-execution lookup above for whatever runs after this one.
 local function clearGlobalConnections()
 	for _, conn in ipairs(GlobalConnections) do
 		pcall(function()
 			conn:Disconnect()
 		end)
 	end
-	GlobalConnections = {}
+	for i = #GlobalConnections, 1, -1 do
+		GlobalConnections[i] = nil
+	end
 end
 
 -- ================= ICONS (vector, zero-asset) =================
@@ -1048,7 +1077,35 @@ function Library:CreateWindow(config)
 		Window:ToggleVisible()
 	end
 
+	self.Window = Window -- lets Library:Destroy() find the current window without the caller having to
+	-- keep their own reference to it around
+
 	return Window
+end
+
+-- Full explicit teardown: disconnects every tracked global connection (via clearGlobalConnections, which
+-- — see its own comment above — also catches a PREVIOUS full script execution's leftover connections
+-- through getgenv()), resets ThemeListeners and Flags the same way CreateWindow does before building a
+-- new window, and destroys the actual GUI (found by name, the same way CreateWindow finds a previous
+-- window to replace — not via `self.Window`, so this still works even if that reference was never set,
+-- e.g. Destroy() called on a freshly-loaded Library instance before CreateWindow has run on it). Doesn't
+-- touch the independent Notify toast layer, which is deliberately decoupled from any Window's lifecycle.
+function Library:Destroy()
+	clearGlobalConnections()
+	ThemeListeners = {}
+	self.Flags = {}
+	local guiParent = getGuiParent()
+	local existing = guiParent:FindFirstChild("IOSRobloxUILib")
+	if existing then
+		existing:Destroy()
+	end
+	self.Window = nil
+end
+
+-- Convenience alias for a script that kept its own `Window` variable instead of the `Library` one — both
+-- fully tear down the same way, since this just delegates straight to Library:Destroy().
+function WindowMeta:Destroy()
+	Library:Destroy()
 end
 
 -- Shows/hides the whole window (`Sheet`) — what the floating button and any keybind wired to it call.
