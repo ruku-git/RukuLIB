@@ -257,3 +257,63 @@ A full line-by-line static review (MCP disconnected for this pass — no live cl
 - `Destroy()` on Dropdown/MultiDropdown/ColorPicker: confirmed the overridden `Destroy` removes the `OptionList`/panel from `Overlay` (not just the row) and drops the flag from `Library.Flags` — this was the gap caught mid-session before ever shipping, see the entry above.
 
 Restored `testhub.lua` as the live demo afterward (exactly one `IOSRobloxUILib` confirmed, zero console errors); cleaned up all throwaway probe/seed scripts.
+
+## 20. Tier 1 Enhancements Batch (Aug 31, 2026)
+
+Implementation and live verification of the Tier 1 roadmap batch across all widgets:
+
+1. **Widget `.Type` Introspection String**:
+   - Added a static `.Type` field across all 13 widget return tables: `"Button"`, `"Toggle"`, `"Slider"`, `"Dropdown"`, `"MultiDropdown"`, `"ColorPicker"`, `"Input"`, `"Keybind"`, `"Label"`, `"Divider"`, `"ProgressBar"`, `"Section"`, `"ConfigManager"`.
+   - Enables runtime type introspection and automated configuration serialization.
+
+2. **`CreateDivider` (Tab & Section)**:
+   - Minimalist 1px hairline horizontal rule (`Radius.Pill` corner, `Colors.Separator` background).
+   - Fully integrated with unified lifecycle methods (`attachLifecycle`, `.Type = "Divider"`).
+
+3. **`CreateProgressBar` (Tab & Section)**:
+   - Visual progress bar widget with rounded track, animated fill (`Colors.Accent`), percentage/custom text display, and smooth tweening.
+   - Methods: `SetProgress(fraction, animate)`, `GetProgress()`, `SetText(overrideText)`, plus standard `attachLifecycle` methods.
+   - Registers in `Library.Flags` when a `Flag` is specified, enabling retrieval via `Library:GetControl`.
+
+4. **`Library:GetControl(flagName)`**:
+   - Flag lookup helper that searches `Library.Flags[flagName]`. Emits a `warn()` diagnostic if the flag does not exist or has not been registered.
+
+5. **Slider Click-to-Edit Numerical Input**:
+   - Replaced the static slider value label with an interactive `TextBox` (`ClearTextOnFocus = false`).
+   - On `FocusLost`, validates input with `tonumber()`, clamps to `[min, max]`, snaps to `Increment`, repositions the fill track, and triggers the callback. Reverts cleanly on invalid input.
+
+## 21. Tier 2 Enhancements Batch (Aug 31, 2026)
+
+Implementation and live verification of the Tier 2 roadmap batch across theming, tabs, dropdowns, and widgets:
+
+1. **Dynamic Custom Theme Registration (`Library:RegisterTheme`)**:
+   - `Library:RegisterTheme(name, tokens)` adds or extends theme palettes directly in `Library.Themes`.
+   - Validates that required base color keys are present (or falls back to `Dark` theme defaults).
+   - Allows instant switching via `Library:SetTheme(name)`.
+
+2. **Dynamic Accent Color Override (`Library:SetAccent`)**:
+   - `Library:SetAccent(color3)` dynamically overrides `Colors.AccentBlue` in the central palette.
+   - Automatically invokes all registered `ThemeListeners`, immediately retinting active toggles, sliders, active tab buttons, notifications, and accents without a full theme reload.
+
+3. **Programmatic Tab Navigation (`SetActiveTab` & `Activate`)**:
+   - `Window:SetActiveTab(target)` supports tab switching by Tab object reference, case-insensitive string name, or 1-based index.
+   - `Tab:Activate()` alias method directly on tab instances to trigger smooth activation.
+   - Accurately executes selection animations, indicator repositioning, page swapping, and dock state updates.
+
+4. **Tab Notification Badges (`Tab:SetBadge`)**:
+   - `Tab:SetBadge(badgeValue)` displays an iOS-style red pill notification badge (`Colors.AccentRed`, auto-width, 10px text, `Radius.Pill`) anchored to the top-right of the dock slot button.
+   - Passing `nil`, `""`, `false`, or `0` hides and destroys the badge.
+   - Handles numeric values (e.g. `99+` overflow format for numbers > 99) as well as custom strings (e.g. `"NEW"`).
+
+5. **`CreateParagraph` Widget (Tab & Section)**:
+   - Rich multi-line content presentation card supporting both `Title` and `Content` (body) strings.
+   - Configured with `AutomaticSize = Enum.AutomaticSize.Y` and `TextWrapped = true` to fluidly adapt to arbitrary text lengths without clipping or manual height management.
+   - Methods: `SetTitle(text)`, `SetContent(text)`, `SetText(text)`, `SetDescription(text)`, `Set(title, content)`, `Get()`, plus standard `attachLifecycle` methods and `.Type = "Paragraph"`.
+
+6. **Searchable & Scrolling Dropdowns (`CreateDropdown` & `CreateMultiDropdown`)**:
+   - Added `Searchable = true` support to both single-select and multi-select dropdown flyouts.
+   - Introduces an embedded search `TextBox` header in the flyout with real-time text query filtering.
+   - Wraps option items in a native `ScrollingFrame` with dynamic `CanvasSize` and configurable `MaxVisible` row height clamping.
+   - Resets search query and displays all options automatically each time the dropdown is opened.
+
+

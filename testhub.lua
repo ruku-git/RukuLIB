@@ -231,6 +231,9 @@ local function setNoclip(enabled)
 end
 
 -- ---- re-apply every persistent effect on respawn ----
+local healthConn
+local updateHealthBar = function() end
+
 LocalPlayer.CharacterAdded:Connect(function()
 	stopFly() -- the old HumanoidRootPart is gone; the RenderStepped loop's own getHRP() check would catch
 	-- this too, but stopping immediately avoids one wasted frame of chasing a dead part
@@ -243,10 +246,39 @@ LocalPlayer.CharacterAdded:Connect(function()
 	if state.Noclip then
 		setNoclip(true)
 	end
+	updateHealthBar()
+	local hum = getHumanoid()
+	if hum then
+		if healthConn then healthConn:Disconnect() end
+		healthConn = hum.HealthChanged:Connect(updateHealthBar)
+	end
 end)
 
--- ================= Character tab: appearance + movement =================
+-- ================= Character tab: appearance + movement + vitals =================
 local Character = Window:CreateTab({ Name = "Character", Icon = "terminal" })
+
+local Vitals = Character:CreateSection({ Title = "Vitals" })
+local healthBar = Vitals:CreateProgressBar({
+	Name = "Health",
+	CurrentValue = 1,
+	Flag = "PlayerHealth",
+})
+
+updateHealthBar = function()
+	local hum = getHumanoid()
+	if hum then
+		local maxHp = math.max(hum.MaxHealth, 1)
+		local frac = math.clamp(hum.Health / maxHp, 0, 1)
+		healthBar:SetProgress(frac, true)
+		healthBar:SetText(string.format("%d / %d HP", math.floor(hum.Health + 0.5), math.floor(maxHp + 0.5)))
+	end
+end
+
+local initHum = getHumanoid()
+if initHum then
+	updateHealthBar()
+	healthConn = initHum.HealthChanged:Connect(updateHealthBar)
+end
 
 local Appearance = Character:CreateSection({ Title = "Appearance" })
 Appearance:CreateColorPicker({
@@ -258,6 +290,7 @@ Appearance:CreateColorPicker({
 		applyColor()
 	end,
 })
+Appearance:CreateDivider()
 Appearance:CreateDropdown({
 	Name = "Material",
 	Options = { "Default", "Neon", "Glass", "ForceField", "Metal", "Wood", "Ice" },
@@ -302,6 +335,8 @@ Movement:CreateKeybind({
 	end,
 })
 
+Movement:CreateDivider()
+
 local noclipToggle = Movement:CreateToggle({
 	Name = "Noclip",
 	Flag = "Noclip",
@@ -317,6 +352,8 @@ Movement:CreateKeybind({
 		noclipToggle:Set(not noclipToggle:Get())
 	end,
 })
+
+Movement:CreateDivider()
 
 Movement:CreateToggle({
 	Name = "Custom WalkSpeed",
@@ -336,6 +373,8 @@ Movement:CreateSlider({
 		applyWalkSpeed()
 	end,
 })
+
+Movement:CreateDivider()
 
 Movement:CreateToggle({
 	Name = "Custom JumpPower",
@@ -387,6 +426,7 @@ Visuals:CreateColorPicker({
 		applyHighlight()
 	end,
 })
+Visuals:CreateDivider()
 Visuals:CreateButton({
 	Name = "Reset Appearance",
 	Callback = function()

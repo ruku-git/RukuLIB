@@ -431,6 +431,37 @@ function Library:SetTheme(theme)
 	end
 end
 
+-- Registers a custom theme preset into Library.Themes so it can be activated anytime via Library:SetTheme(name).
+-- Any tokens omitted from the custom `tokens` table automatically fallback to the built-in Dark theme palette.
+function Library:RegisterTheme(name, tokens)
+	if typeof(name) ~= "string" or typeof(tokens) ~= "table" then
+		warn("[iOSRobloxUILib] RegisterTheme: name must be a string and tokens must be a table")
+		return
+	end
+	local newTheme = {}
+	for k, v in pairs(self.Themes.Dark) do
+		newTheme[k] = v
+	end
+	for k, v in pairs(tokens) do
+		newTheme[k] = v
+	end
+	self.Themes[name] = newTheme
+	return self
+end
+
+-- Dynamically mutates the library's primary accent color token (Colors.AccentBlue) and broadcasts
+-- the change to all registered UI theme listeners across all open widgets and tabs in real time.
+function Library:SetAccent(color)
+	if typeof(color) ~= "Color3" then
+		warn("[iOSRobloxUILib] SetAccent: expected Color3, got " .. typeof(color))
+		return
+	end
+	Colors.AccentBlue = color
+	for _, fn in ipairs(ThemeListeners) do
+		pcall(fn)
+	end
+end
+
 -- Config files are named (not one fixed file) so a script can offer multiple saved presets — see
 -- Library:ListConfigs / CreateConfigManager below. All live under one folder in the executor's own
 -- sandboxed workspace (same writefile/readfile sandboxing note as everywhere else here, not a real OS path).
@@ -1320,6 +1351,28 @@ function WindowMeta:CreateTab(config)
 		self.ActiveTab = Tab
 	end
 
+	Tab.ActivateTab = activate
+
+	onTheme(function()
+		if slot and slot.Parent then
+			if self.ActiveTab == Tab then
+				slot.BackgroundColor3 = Colors.AccentBlue
+				slotStroke.Color = Colors.AccentBlue
+				local activeIcon = slot:FindFirstChild("Icon")
+				if activeIcon then
+					tintIcon(activeIcon, Colors.TextPrimary)
+				end
+			else
+				slot.BackgroundColor3 = Colors.BgCard
+				slotStroke.Color = Color3.new(1, 1, 1)
+				local idleIcon = slot:FindFirstChild("Icon")
+				if idleIcon then
+					tintIcon(idleIcon, Colors.TextSecondary)
+				end
+			end
+		end
+	end)
+
 	slot.MouseButton1Click:Connect(activate)
 	slot.MouseEnter:Connect(function()
 		if self.ActiveTab ~= Tab then
@@ -1338,6 +1391,99 @@ function WindowMeta:CreateTab(config)
 	end
 
 	return Tab
+end
+
+-- Programmatically switches the active tab by instance reference, name (case-insensitive), or 1-based index.
+function WindowMeta:SetActiveTab(tabTarget)
+	if typeof(tabTarget) == "table" and tabTarget.ActivateTab then
+		tabTarget:Activate()
+		return tabTarget
+	elseif typeof(tabTarget) == "string" then
+		local lowerTarget = string.lower(tabTarget)
+		for _, tab in ipairs(self.Tabs) do
+			if string.lower(tab.Name) == lowerTarget then
+				tab:Activate()
+				return tab
+			end
+		end
+		warn("[iOSRobloxUILib] SetActiveTab: no tab found with name '" .. tostring(tabTarget) .. "'")
+	elseif typeof(tabTarget) == "number" then
+		local tab = self.Tabs[tabTarget]
+		if tab then
+			tab:Activate()
+			return tab
+		else
+			warn("[iOSRobloxUILib] SetActiveTab: index " .. tostring(tabTarget) .. " out of bounds")
+		end
+	end
+end
+
+-- Programmatically activates this tab.
+function TabMeta:Activate()
+	if self.ActivateTab then
+		self.ActivateTab()
+	end
+	return self
+end
+
+-- Sets or clears a numeric or text badge pill on the tab's dock button (e.g. 3, "!", "NEW", 99+).
+-- Passing nil, false, "", or 0 hides the badge.
+function TabMeta:SetBadge(badgeValue)
+	local slot = self.Slot
+	if not slot then
+		return self
+	end
+	local badge = slot:FindFirstChild("Badge")
+	if badgeValue == nil or badgeValue == false or badgeValue == "" or badgeValue == 0 then
+		if badge then
+			badge.Visible = false
+		end
+		return self
+	end
+
+	local text = tostring(badgeValue)
+	if typeof(badgeValue) == "number" and badgeValue > 99 then
+		text = "99+"
+	end
+
+	if not badge then
+		badge = new("Frame", {
+			Name = "Badge",
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, 4, 0, -4),
+			Size = UDim2.fromOffset(16, 16),
+			AutomaticSize = Enum.AutomaticSize.X,
+			BackgroundColor3 = Colors.AccentRed,
+			BackgroundTransparency = 0,
+			ZIndex = 5,
+			Parent = slot,
+		})
+		themed(badge, "BackgroundColor3", "AccentRed")
+		corner(badge, Radius.Pill)
+		pad(badge, nil, 1, 4, 1, 4)
+
+		local label = new("TextLabel", {
+			Name = "BadgeText",
+			Font = Fonts.Body,
+			Text = text,
+			TextSize = 9,
+			TextColor3 = Color3.new(1, 1, 1),
+			TextXAlignment = Enum.TextXAlignment.Center,
+			TextYAlignment = Enum.TextYAlignment.Center,
+			BackgroundTransparency = 1,
+			Size = UDim2.fromScale(1, 1),
+			ZIndex = 6,
+			Parent = badge,
+		})
+	else
+		local label = badge:FindFirstChild("BadgeText")
+		if label then
+			label.Text = text
+		end
+		badge.Visible = true
+	end
+
+	return self
 end
 
 -- ---- shared row scaffold ----
@@ -1517,6 +1663,154 @@ function TabMeta:CreateLabel(config)
 	-- A Label has no separate "name" concept — `SetName` retargets its own displayed text, same field
 	-- `config.Text` set it from. No description slot (it IS the text), so `SetDescription` is a no-op.
 	return attachLifecycle({ Type = "Label" }, row, disableOverlay, label, nil, nil, nil)
+end
+
+-- Multi-line structured card or section text block with optional title header and descriptive body.
+-- Supports automatic vertical expansion, dynamic SetTitle / SetContent / Set / Get methods, and Flag tracking.
+function TabMeta:CreateParagraph(config)
+	config = config or {}
+	local titleText = config.Title or config.Name or ""
+	local contentText = config.Content or config.Text or config.Description or ""
+
+	self.RowCount += 1
+	local row = new("Frame", {
+		Name = "Paragraph" .. self.RowCount,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = Colors.BgCard,
+		BackgroundTransparency = self.FlatRows and 1 or 0.5,
+		LayoutOrder = self.RowCount,
+		Parent = self.Page,
+	})
+	if not self.FlatRows then
+		corner(row, Radius.Control)
+		stroke(row, 0.9, 1)
+	end
+	themed(row, "BackgroundColor3", "BgCard")
+	pad(row, nil, 8, Spacing.PaddingSide, 8, Spacing.PaddingSide)
+
+	local layout = new("UIListLayout", {
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, 4),
+		Parent = row,
+	})
+
+	local titleLabel = new("TextLabel", {
+		Name = "Title",
+		Font = Fonts.Body,
+		Text = titleText,
+		TextSize = 13,
+		TextColor3 = Colors.TextPrimary,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		TextWrapped = true,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		Visible = titleText ~= "",
+		LayoutOrder = 1,
+		Parent = row,
+	})
+	themed(titleLabel, "TextColor3", "TextPrimary")
+
+	local contentLabel = new("TextLabel", {
+		Name = "Content",
+		Font = Fonts.SubBody,
+		Text = contentText,
+		TextSize = 12,
+		TextColor3 = Colors.TextSecondary,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		TextWrapped = true,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		Visible = contentText ~= "",
+		LayoutOrder = 2,
+		Parent = row,
+	})
+	themed(contentLabel, "TextColor3", "TextSecondary")
+
+	local disableOverlay = new("Frame", {
+		Name = "DisableOverlay",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 0.5,
+		Visible = false,
+		ZIndex = 4,
+		Parent = row,
+	})
+	if not self.FlatRows then
+		corner(disableOverlay, Radius.Control)
+	end
+
+	local control = {
+		Type = "Paragraph",
+		Title = titleText,
+		Content = contentText,
+	}
+
+	function control:SetTitle(newTitle)
+		self.Title = tostring(newTitle or "")
+		titleLabel.Text = self.Title
+		titleLabel.Visible = self.Title ~= ""
+		return self
+	end
+	control.SetName = control.SetTitle
+
+	function control:SetContent(newContent)
+		self.Content = tostring(newContent or "")
+		contentLabel.Text = self.Content
+		contentLabel.Visible = self.Content ~= ""
+		return self
+	end
+	control.SetText = control.SetContent
+	control.SetDescription = control.SetContent
+
+	function control:Set(titleOrTable, maybeContent)
+		if typeof(titleOrTable) == "table" then
+			if titleOrTable.Title or titleOrTable.Name then
+				self:SetTitle(titleOrTable.Title or titleOrTable.Name)
+			end
+			if titleOrTable.Content or titleOrTable.Text or titleOrTable.Description then
+				self:SetContent(titleOrTable.Content or titleOrTable.Text or titleOrTable.Description)
+			end
+		else
+			if titleOrTable ~= nil then
+				self:SetTitle(titleOrTable)
+			end
+			if maybeContent ~= nil then
+				self:SetContent(maybeContent)
+			end
+		end
+		return self
+	end
+
+	function control:Get()
+		return {
+			Title = self.Title,
+			Content = self.Content,
+		}
+	end
+
+	control.SetVisible = function(_, visible)
+		row.Visible = visible
+	end
+	control.SetEnabled = function(_, enabled)
+		disableOverlay.Visible = not enabled
+	end
+	control.Destroy = function()
+		if config.Flag and Library.Flags[config.Flag] == control then
+			Library.Flags[config.Flag] = nil
+		end
+		row:Destroy()
+	end
+
+	if config.Flag then
+		Library.Flags[config.Flag] = control
+	end
+
+	return control
 end
 
 -- Groups related widgets under one titled card (e.g. "Theme", "Config") instead of them sitting as loose
@@ -1966,6 +2260,10 @@ function TabMeta:CreateDropdown(config)
 	local options = config.Options or {}
 	local current = config.CurrentOption or options[1] or ""
 	local callback = config.Callback or function() end
+	local searchable = config.Searchable == true
+	local maxVisible = config.MaxVisibleOptions or 6
+	local flyoutWidth = config.FlyoutWidth or (searchable and 120 or 96)
+	local searchH = searchable and 26 or 0
 
 	local row, disableOverlay = baseRow(self, 40)
 	local block, titleLabel, descLabel = labelBlock(row, name, config.Description)
@@ -1973,7 +2271,7 @@ function TabMeta:CreateDropdown(config)
 	local btn = new("TextButton", {
 		AnchorPoint = Vector2.new(1, 0.5),
 		Position = UDim2.new(1, 0, 0.5, 0),
-		Size = UDim2.fromOffset(96, 26),
+		Size = UDim2.fromOffset(flyoutWidth, 26),
 		BackgroundColor3 = Colors.BgFrame,
 		AutoButtonColor = false,
 		Text = "",
@@ -1987,6 +2285,7 @@ function TabMeta:CreateDropdown(config)
 		Text = current,
 		TextSize = 11,
 		TextColor3 = Colors.TextPrimary,
+		TextTruncate = Enum.TextTruncate.AtEnd,
 		BackgroundTransparency = 1,
 		Size = UDim2.fromScale(1, 1),
 		Parent = btn,
@@ -1996,35 +2295,95 @@ function TabMeta:CreateDropdown(config)
 	local overlay = self.Window.Overlay
 	local sheet = overlay.Parent
 
-	-- mutable now (was a fixed local computed once from the initial `options`): `Refresh` below can change
-	-- the option count at any time, and the open/positioning code always needs the CURRENT height, not the
-	-- one captured at creation.
-	local listHeight = #options * 24
+	local listHeight = searchH + (math.min(#options, maxVisible) * 24)
 	local list = new("Frame", {
 		Name = "OptionList",
-		Active = true, -- belt-and-suspenders: still block clicks to whatever's directly behind the flyout
-		-- itself, even though the real fix is being parented to `overlay` below instead of nested inside
-		-- this dropdown's own row.
-		ClipsDescendants = true, -- lets the height tween below double as the open/close reveal
+		Active = true,
+		ClipsDescendants = true,
 		Visible = false,
 		BackgroundTransparency = 1,
 		ZIndex = 10,
 		AnchorPoint = Vector2.new(1, 0),
-		Size = UDim2.fromOffset(96, 0),
+		Size = UDim2.fromOffset(flyoutWidth, 0),
 		BackgroundColor3 = Colors.BgFrame,
-		Parent = overlay, -- NOT `btn` — being nested inside its own row put the flyout in the same branch
-		-- as every other row (including Test Button's), and a single click could register on an option
-		-- button here AND a button in a completely different row at the same time (confirmed live: giving
-		-- the flyout Active=true alone did not stop it). Parenting to the shared top-level `overlay`
-		-- instead makes the flyout a fully separate branch from every row, so there's no other row's
-		-- button anywhere "behind" it for a click to also land on.
+		Parent = overlay,
 	})
 	themed(list, "BackgroundColor3", "BgFrame")
 	corner(list, Radius.Slot)
 	stroke(list, 0.85, 1)
-	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Parent = list })
+
+	local searchBox
+	if searchable then
+		local searchHeader = new("Frame", {
+			Name = "SearchHeader",
+			Size = UDim2.new(1, 0, 0, 26),
+			BackgroundTransparency = 1,
+			ZIndex = 10,
+			Parent = list,
+		})
+		searchBox = new("TextBox", {
+			Font = Fonts.SubBody,
+			Text = "",
+			TextSize = 11,
+			TextColor3 = Colors.TextPrimary,
+			PlaceholderText = "Search...",
+			PlaceholderColor3 = Colors.TextTertiary,
+			ClearTextOnFocus = false,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, -14, 1, 0),
+			Position = UDim2.fromOffset(7, 0),
+			TextXAlignment = Enum.TextXAlignment.Left,
+			ZIndex = 11,
+			Parent = searchHeader,
+		})
+		themed(searchBox, "TextColor3", "TextPrimary")
+		local searchDivider = new("Frame", {
+			Name = "Divider",
+			Size = UDim2.new(1, 0, 0, 1),
+			Position = UDim2.new(0, 0, 1, -1),
+			BackgroundColor3 = Colors.BorderSubtle,
+			BorderSizePixel = 0,
+			ZIndex = 11,
+			Parent = searchHeader,
+		})
+		themed(searchDivider, "BackgroundColor3", "BorderSubtle")
+	end
+
+	local scroll = new("ScrollingFrame", {
+		Name = "Scroll",
+		Position = UDim2.fromOffset(0, searchH),
+		Size = UDim2.new(1, 0, 1, -searchH),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = Colors.BorderSubtle,
+		CanvasSize = UDim2.new(0, 0, 0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ZIndex = 10,
+		Parent = list,
+	})
+	themed(scroll, "ScrollBarImageColor3", "BorderSubtle")
+	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Parent = scroll })
+
+	local noResultsLabel
+	if searchable then
+		noResultsLabel = new("TextLabel", {
+			Font = Fonts.SubBody,
+			Text = "No matches",
+			TextSize = 10,
+			TextColor3 = Colors.TextTertiary,
+			TextXAlignment = Enum.TextXAlignment.Center,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 24),
+			Visible = false,
+			ZIndex = 10,
+			Parent = scroll,
+		})
+		themed(noResultsLabel, "TextColor3", "TextTertiary")
+	end
 
 	local optLabels = {}
+	local optButtons = {}
 	local open = false
 
 	local function highlight()
@@ -2034,46 +2393,61 @@ function TabMeta:CreateDropdown(config)
 			})
 		end
 	end
-	onTheme(highlight) -- re-reads current Colors.AccentBlue/TextSecondary so idle (never-reopened) option colors refresh too
+	onTheme(highlight)
 
-	local setOpen -- forward-declared: rebuildOptions (below) needs to close-on-pick from inside its own click handlers
+	local setOpen
 
-	-- Builds (or rebuilds, for Refresh) every option button from the current `options` table. Pulled out of
-	-- the old inline creation loop so Refresh can call the exact same logic instead of duplicating it.
+	local function filterOptions(query)
+		query = string.lower(query or "")
+		local matchCount = 0
+		for option, optBtn in pairs(optButtons) do
+			local visible = query == "" or string.find(string.lower(option), query, 1, true) ~= nil
+			optBtn.Visible = visible
+			if visible then
+				matchCount += 1
+			end
+		end
+		if noResultsLabel then
+			noResultsLabel.Visible = (matchCount == 0 and query ~= "")
+			if matchCount == 0 and query ~= "" then
+				matchCount = 1
+			end
+		end
+		return matchCount
+	end
+
 	local function rebuildOptions()
-		for _, child in ipairs(list:GetChildren()) do
-			if child:IsA("GuiObject") then
+		for _, child in ipairs(scroll:GetChildren()) do
+			if child:IsA("TextButton") then
 				child:Destroy()
 			end
 		end
 		optLabels = {}
-		listHeight = #options * 24
+		optButtons = {}
 		for i, option in ipairs(options) do
 			local opt = new("TextButton", {
 				Size = UDim2.new(1, 0, 0, 24),
 				BackgroundTransparency = 1,
 				Text = "",
 				LayoutOrder = i,
-				-- ZIndex is NOT inherited from parent in Roblox — `list` being ZIndex=10 does nothing for
-				-- this button's own input priority. Without this, `opt` defaulted to ZIndex=1, tying with
-				-- Test Button's own default-ZIndex TextButton. Global ZIndexBehavior breaks same-ZIndex ties
-				-- by creation order, which is why clicking "Noclip" was flaky: sometimes the option won,
-				-- sometimes Test Button won underneath it, sometimes both fired. Matching `list`'s ZIndex
-				-- here makes the option button unambiguously win over any row's default-ZIndex content.
 				ZIndex = 10,
-				Parent = list,
+				Parent = scroll,
 			})
 			local optLabel = new("TextLabel", {
 				Font = Fonts.SubBody,
 				Text = option,
 				TextSize = 11,
 				TextColor3 = option == current and Colors.AccentBlue or Colors.TextSecondary,
+				TextTruncate = Enum.TextTruncate.AtEnd,
 				BackgroundTransparency = 1,
-				Size = UDim2.fromScale(1, 1),
+				Position = UDim2.fromOffset(8, 0),
+				Size = UDim2.new(1, -16, 1, 0),
+				TextXAlignment = Enum.TextXAlignment.Left,
 				ZIndex = 11,
 				Parent = opt,
 			})
 			optLabels[option] = optLabel
+			optButtons[option] = opt
 			opt.MouseButton1Click:Connect(function()
 				current = option
 				btnLabel.Text = option
@@ -2082,12 +2456,10 @@ function TabMeta:CreateDropdown(config)
 				task.spawn(callback, current)
 			end)
 		end
+		local count = filterOptions(searchBox and searchBox.Text or "")
+		listHeight = searchH + (math.min(count, maxVisible) * 24)
 	end
 
-	-- Repositions the open flyout against `btn`'s LIVE position/size — connected below to both the anchor
-	-- button moving (dock collapse/expand, or any future layout change) and the sheet resizing (the drag-
-	-- to-resize corner handle). Without this, an open dropdown stayed anchored to wherever it was at open
-	-- time and visually detached from its own button the moment either changed underneath it.
 	local function reposition()
 		if open then
 			positionFlyout(sheet, btn, list, listHeight)
@@ -2099,14 +2471,6 @@ function TabMeta:CreateDropdown(config)
 			return
 		end
 		if value then
-			-- Close whatever's currently registered as the active flyout BEFORE flipping our own `open`
-			-- flag to true. Reopening this exact widget when it's still the last-registered closer (e.g.
-			-- after being auto-closed by a tab switch, since closing never resets the registration back to
-			-- a no-op) used to call CloseActiveFlyout() with `open` already true — invoking this widget's
-			-- OWN stale closure against its own new state, which immediately called setOpen(false) back
-			-- into itself and left `open` permanently desynced (stuck reporting closed while the list
-			-- stayed visually open forever, ignoring every subsequent click). Calling it while `open` is
-			-- still false makes that self-call a safe no-op regardless of ordering.
 			self.Window.CloseActiveFlyout()
 		end
 		open = value
@@ -2116,17 +2480,18 @@ function TabMeta:CreateDropdown(config)
 					setOpen(false)
 				end
 			end
-			-- computed fresh on every open, in overlay-local pixel offsets, since `btn` can move (dock
-			-- collapse/expand, tab switches) and the flyout no longer inherits `btn`'s position for free.
-			-- Also flips above the button (or clamps) instead of always opening below, since `sheet`'s
-			-- ClipsDescendants would otherwise silently cut off a flyout that overflows past its bottom
-			-- edge (confirmed live: this exact clipping on the color picker panel, same root cause here).
+			if searchBox then
+				searchBox.Text = ""
+			end
+			scroll.CanvasPosition = Vector2.new(0, 0)
+			local count = filterOptions("")
+			listHeight = searchH + (math.min(count, maxVisible) * 24)
 			positionFlyout(sheet, btn, list, listHeight)
 			highlight()
 			list.Visible = true
-			tween(list, Motion.Tab, { Size = UDim2.fromOffset(96, listHeight), BackgroundTransparency = 0 })
+			tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, listHeight), BackgroundTransparency = 0 })
 		else
-			local closeTween = tween(list, Motion.Tab, { Size = UDim2.fromOffset(96, 0), BackgroundTransparency = 1 })
+			local closeTween = tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, 0), BackgroundTransparency = 1 })
 			closeTween.Completed:Connect(function(state)
 				if state == Enum.PlaybackState.Completed and not open then
 					list.Visible = false
@@ -2136,11 +2501,17 @@ function TabMeta:CreateDropdown(config)
 	end
 	setOpen = setOpenImpl
 
+	if searchBox then
+		searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+			if not open then return end
+			local count = filterOptions(searchBox.Text)
+			listHeight = searchH + (math.min(count, maxVisible) * 24)
+			positionFlyout(sheet, btn, list, listHeight)
+			tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, listHeight) })
+		end)
+	end
+
 	rebuildOptions()
-	-- `btn`'s own connection auto-disconnects when `row` (its parent) is destroyed, same as every other
-	-- Instance-level connection in this file — but `list` lives in `Overlay`, NOT under `row`, so the
-	-- `sheet` connection wouldn't: it's rooted on the WINDOW's own Sheet, which outlives this one widget.
-	-- Captured so this control's overridden `Destroy` below can disconnect it explicitly.
 	btn:GetPropertyChangedSignal("AbsolutePosition"):Connect(reposition)
 	local sheetResizeConn = sheet:GetPropertyChangedSignal("AbsoluteSize"):Connect(reposition)
 
@@ -2151,12 +2522,6 @@ function TabMeta:CreateDropdown(config)
 	local control = {
 		Type = "Dropdown",
 		Set = function(_, option)
-			-- `optLabels` is already keyed by every valid option string (built above alongside the option
-			-- buttons), so it doubles as a membership check for free. Without this, Set silently accepted
-			-- any string at all — e.g. a config saved by an older script version with a different Options
-			-- list would display a value that isn't actually selectable or highlighted anywhere in the
-			-- list, and a callback written as `if v == "A" then ... elseif v == "B" then ...` would just
-			-- silently fall through for it.
 			if not optLabels[option] then
 				return
 			end
@@ -2168,17 +2533,8 @@ function TabMeta:CreateDropdown(config)
 		Get = function()
 			return current
 		end,
-		-- Rebuilds the option list from a new Options array — previously the only way to change what a
-		-- dropdown could show was destroying and recreating the whole widget. If `current` isn't in the new
-		-- list, falls back to the new first option (or "" for an empty list) rather than silently keeping a
-		-- now-invalid selection nothing in the rebuilt list would highlight or accept via Set.
 		Refresh = function(_, newOptions)
 			options = newOptions or {}
-			-- Membership check MUST run against the REBUILT optLabels, not the stale pre-refresh one — checking
-			-- first (against the old table, still keyed by the OLD options) let a `current` that used to be
-			-- valid silently survive a refresh that actually dropped it, since the old table still said "yes,
-			-- I recognize this" right up until rebuildOptions() replaced it. Caught live: refreshing away from
-			-- an option that was "current" kept displaying it as selected in a list that no longer contained it.
 			rebuildOptions()
 			if not optLabels[current] then
 				current = options[1] or ""
@@ -2187,7 +2543,7 @@ function TabMeta:CreateDropdown(config)
 			highlight()
 			if open then
 				positionFlyout(sheet, btn, list, listHeight)
-				tween(list, Motion.Tab, { Size = UDim2.fromOffset(96, listHeight) })
+				tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, listHeight) })
 			end
 		end,
 	}
@@ -2195,10 +2551,6 @@ function TabMeta:CreateDropdown(config)
 		Library.Flags[config.Flag] = control
 	end
 	attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, block, config.Flag)
-	-- Overridden, not just inherited: the base Destroy only tears down `row` — `list` lives in `Overlay`
-	-- (never a child of `row`, by design — see its own creation comment above), so it needs its own
-	-- explicit cleanup, and so does the one connection rooted on the window's `sheet` instead of on
-	-- anything under this row.
 	local baseDestroy = control.Destroy
 	control.Destroy = function()
 		sheetResizeConn:Disconnect()
@@ -2729,6 +3081,8 @@ function TabMeta:CreateMultiDropdown(config)
 		selected[v] = true
 	end
 	local callback = config.Callback or function() end
+	local searchable = config.Searchable == true
+	local maxVisible = math.max(1, tonumber(config.MaxVisible) or 6)
 
 	local row, disableOverlay = baseRow(self, 40)
 	local block, titleLabel, descLabel = labelBlock(row, name, config.Description)
@@ -2771,52 +3125,142 @@ function TabMeta:CreateMultiDropdown(config)
 	local overlay = self.Window.Overlay
 	local sheet = overlay.Parent
 
-	-- mutable now, same reason as CreateDropdown's own `listHeight`: `Refresh` below can change the option
-	-- count at any time.
-	local listHeight = #options * 24
+	local flyoutWidth = 140
+	local searchH = searchable and 26 or 0
+	local listHeight = searchH + (math.min(#options, maxVisible) * 24)
+
 	local list = new("Frame", {
 		Name = "OptionList",
-		Active = true, -- see CreateDropdown for why: belt-and-suspenders alongside Overlay-parenting below
+		Active = true,
 		ClipsDescendants = true,
 		Visible = false,
 		BackgroundTransparency = 1,
 		ZIndex = 10,
 		AnchorPoint = Vector2.new(1, 0),
-		Size = UDim2.fromOffset(140, 0),
+		Size = UDim2.fromOffset(flyoutWidth, 0),
 		BackgroundColor3 = Colors.BgFrame,
-		Parent = overlay, -- same overlay-parenting fix as CreateDropdown (bug #6/#7/#8) — never nest a
-		-- flyout inside its own row.
+		Parent = overlay,
 	})
 	themed(list, "BackgroundColor3", "BgFrame")
 	corner(list, Radius.Slot)
 	stroke(list, 0.85, 1)
 	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Parent = list })
 
-	local checks = {}
-	local open = false
-	local setOpen -- forward-declared: rebuildOptions (below) needs it for the theme listener below to stay valid across a Refresh
+	local searchBox
+	if searchable then
+		local searchRow = new("Frame", {
+			Name = "SearchRow",
+			Size = UDim2.new(1, 0, 0, 26),
+			BackgroundTransparency = 1,
+			LayoutOrder = 0,
+			ZIndex = 10,
+			Parent = list,
+		})
+		searchBox = new("TextBox", {
+			Name = "SearchBox",
+			Font = Fonts.SubBody,
+			PlaceholderText = "Search...",
+			PlaceholderColor3 = Colors.TextTertiary,
+			TextColor3 = Colors.TextPrimary,
+			TextSize = 10,
+			Text = "",
+			ClearTextOnFocus = false,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, -12, 1, 0),
+			Position = UDim2.fromOffset(6, 0),
+			TextXAlignment = Enum.TextXAlignment.Left,
+			ZIndex = 11,
+			Parent = searchRow,
+		})
+		themed(searchBox, "TextColor3", "TextPrimary")
+		themed(searchBox, "PlaceholderColor3", "TextTertiary")
+		local div = new("Frame", {
+			Name = "SearchDivider",
+			Size = UDim2.new(1, 0, 0, 1),
+			Position = UDim2.new(0, 0, 1, -1),
+			BackgroundColor3 = Colors.BorderSubtle,
+			BackgroundTransparency = 0.5,
+			BorderSizePixel = 0,
+			ZIndex = 11,
+			Parent = searchRow,
+		})
+		themed(div, "BackgroundColor3", "BorderSubtle")
+	end
 
-	-- Builds (or rebuilds, for Refresh) every checkbox row from the current `options`/`selected` tables —
-	-- same pull-out-of-the-creation-loop treatment as CreateDropdown's own rebuildOptions, for the same reason.
+	local scroll = new("ScrollingFrame", {
+		Name = "OptionScroll",
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 2,
+		ScrollBarImageColor3 = Colors.BorderSubtle,
+		ScrollBarImageTransparency = 0.3,
+		CanvasPosition = Vector2.new(0, 0),
+		Size = UDim2.new(1, 0, 1, -searchH),
+		CanvasSize = UDim2.new(0, 0, 0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ZIndex = 10,
+		Parent = list,
+	})
+	themed(scroll, "ScrollBarImageColor3", "BorderSubtle")
+	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Parent = scroll })
+
+	local noResultsLabel
+	if searchable then
+		noResultsLabel = new("TextLabel", {
+			Font = Fonts.SubBody,
+			Text = "No matches",
+			TextSize = 10,
+			TextColor3 = Colors.TextTertiary,
+			TextXAlignment = Enum.TextXAlignment.Center,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 24),
+			Visible = false,
+			ZIndex = 10,
+			Parent = scroll,
+		})
+		themed(noResultsLabel, "TextColor3", "TextTertiary")
+	end
+
+	local checks = {}
+	local optButtons = {}
+	local open = false
+	local setOpen
+
+	local function filterOptions(query)
+		query = string.lower(query or "")
+		local matchCount = 0
+		for option, optBtn in pairs(optButtons) do
+			local visible = query == "" or string.find(string.lower(option), query, 1, true) ~= nil
+			optBtn.Visible = visible
+			if visible then
+				matchCount += 1
+			end
+		end
+		if noResultsLabel then
+			noResultsLabel.Visible = (matchCount == 0 and query ~= "")
+			if matchCount == 0 and query ~= "" then
+				matchCount = 1
+			end
+		end
+		return matchCount
+	end
+
 	local function rebuildOptions()
-		for _, child in ipairs(list:GetChildren()) do
-			if child:IsA("GuiObject") then
+		for _, child in ipairs(scroll:GetChildren()) do
+			if child:IsA("TextButton") then
 				child:Destroy()
 			end
 		end
 		checks = {}
-		listHeight = #options * 24
+		optButtons = {}
 		for i, option in ipairs(options) do
 			local opt = new("TextButton", {
 				Size = UDim2.new(1, 0, 0, 24),
 				BackgroundTransparency = 1,
 				Text = "",
 				LayoutOrder = i,
-				-- see CreateDropdown's `opt` for why this must be explicit and match `list` (bug #9): ZIndex
-				-- is never inherited from parent in Roblox, so this would otherwise default to 1 and tie with
-				-- whatever row-content sits behind the flyout.
 				ZIndex = 10,
-				Parent = list,
+				Parent = scroll,
 			})
 			local check = new("Frame", {
 				Name = "Check",
@@ -2843,6 +3287,7 @@ function TabMeta:CreateMultiDropdown(config)
 			})
 			themed(optLabel, "TextColor3", "TextSecondary")
 			checks[option] = check
+			optButtons[option] = opt
 			opt.MouseButton1Click:Connect(function()
 				selected[option] = not selected[option]
 				tween(check, Motion.Tab, { BackgroundColor3 = selected[option] and Colors.AccentBlue or Colors.BgFrame })
@@ -2856,24 +3301,21 @@ function TabMeta:CreateMultiDropdown(config)
 				task.spawn(callback, result)
 			end)
 		end
+		local count = filterOptions(searchBox and searchBox.Text or "")
+		listHeight = searchH + (math.min(count, maxVisible) * 24)
 	end
 
-	-- same live-reposition fix as CreateDropdown: without this, an open MultiDropdown list stayed anchored
-	-- to wherever it was at open-time and drifted from `btn` the moment the dock collapsed/expanded or the
-	-- window resized underneath it.
 	local function reposition()
 		if open then
 			positionFlyout(sheet, btn, list, listHeight)
 		end
 	end
 
-	setOpen = function(value)
+	local function setOpenImpl(value)
 		if open == value then
 			return
 		end
 		if value then
-			-- see CreateDropdown's setOpen for why this closes-others call must happen before `open` is
-			-- set true (reentrancy: reopening this same widget while it's still the registered closer)
 			self.Window.CloseActiveFlyout()
 		end
 		open = value
@@ -2883,11 +3325,17 @@ function TabMeta:CreateMultiDropdown(config)
 					setOpen(false)
 				end
 			end
-			positionFlyout(sheet, btn, list, listHeight) -- see CreateDropdown for why this flips/clamps
+			if searchBox then
+				searchBox.Text = ""
+			end
+			scroll.CanvasPosition = Vector2.new(0, 0)
+			local count = filterOptions("")
+			listHeight = searchH + (math.min(count, maxVisible) * 24)
+			positionFlyout(sheet, btn, list, listHeight)
 			list.Visible = true
-			tween(list, Motion.Tab, { Size = UDim2.fromOffset(140, listHeight), BackgroundTransparency = 0 })
+			tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, listHeight), BackgroundTransparency = 0 })
 		else
-			local closeTween = tween(list, Motion.Tab, { Size = UDim2.fromOffset(140, 0), BackgroundTransparency = 1 })
+			local closeTween = tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, 0), BackgroundTransparency = 1 })
 			closeTween.Completed:Connect(function(state)
 				if state == Enum.PlaybackState.Completed and not open then
 					list.Visible = false
@@ -2895,10 +3343,19 @@ function TabMeta:CreateMultiDropdown(config)
 			end)
 		end
 	end
+	setOpen = setOpenImpl
+
+	if searchBox then
+		searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+			if not open then return end
+			local count = filterOptions(searchBox.Text)
+			listHeight = searchH + (math.min(count, maxVisible) * 24)
+			positionFlyout(sheet, btn, list, listHeight)
+			tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, listHeight) })
+		end)
+	end
 
 	rebuildOptions()
-	-- see CreateDropdown's identical comment: `btn`'s connection dies with `row`, `sheet`'s doesn't (it's
-	-- rooted on the window, not this widget) — captured for this control's overridden Destroy below.
 	btn:GetPropertyChangedSignal("AbsolutePosition"):Connect(reposition)
 	local sheetResizeConn = sheet:GetPropertyChangedSignal("AbsoluteSize"):Connect(reposition)
 
@@ -2925,9 +3382,6 @@ function TabMeta:CreateMultiDropdown(config)
 	local control = {
 		Type = "MultiDropdown",
 		Set = function(_, optionsList)
-			-- `optionsList = optionsList or {}`: a nil argument (e.g. "clear every selection") used to
-			-- crash outright — `ipairs(nil)` throws, it doesn't just iterate zero times. Treating nil as
-			-- an empty list makes "select none" an actual supported call instead of a footgun.
 			optionsList = optionsList or {}
 			for k in pairs(selected) do
 				selected[k] = nil
@@ -2939,15 +3393,9 @@ function TabMeta:CreateMultiDropdown(config)
 				check.BackgroundColor3 = selected[option] and Colors.AccentBlue or Colors.BgFrame
 			end
 			refreshLabel()
-			-- was silently missing: LoadConfig restoring a saved ESP-style selection updated the
-			-- checkboxes/label but never told the host script to actually re-apply the effect — the exact
-			-- same class of bug already fixed for Toggle earlier in this project (see SESSION_NOTES.md).
 			task.spawn(callback, getSelected())
 		end,
 		Get = getSelected,
-		-- Rebuilds the checkbox list from a new Options array, same idea as Dropdown's Refresh — dropping
-		-- any current selections that aren't in the new list rather than leaving them silently checked
-		-- but invisible/unreachable in the rebuilt list.
 		Refresh = function(_, newOptions)
 			options = newOptions or {}
 			local stillValid = {}
@@ -2963,7 +3411,7 @@ function TabMeta:CreateMultiDropdown(config)
 			refreshLabel()
 			if open then
 				positionFlyout(sheet, btn, list, listHeight)
-				tween(list, Motion.Tab, { Size = UDim2.fromOffset(140, listHeight) })
+				tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, listHeight) })
 			end
 		end,
 	}
@@ -2971,7 +3419,6 @@ function TabMeta:CreateMultiDropdown(config)
 		Library.Flags[config.Flag] = control
 	end
 	attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, block, config.Flag)
-	-- same override as CreateDropdown, same reason: `list` lives in `Overlay`, not under `row`.
 	local baseDestroy = control.Destroy
 	control.Destroy = function()
 		sheetResizeConn:Disconnect()
