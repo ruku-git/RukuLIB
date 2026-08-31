@@ -17,13 +17,19 @@
 	Tab:CreateButton({Name = "Test Button", Callback = function() end})
 	Tab:CreateKeybind({Name = "Toggle Menu", CurrentKeybind = "RightControl", Flag = "MenuToggleBind",
 		Callback = function() Window:ToggleVisible() end}) -- Flag'd, so the bind itself persists via SaveConfig
+	Tab:CreateDivider() -- 1px visual separator, cheaper than a full CreateSection
+	local progress = Tab:CreateProgressBar({Name = "Download", CurrentValue = 0}) -- display-only, no Flag
+	progress:SetProgress(0.4) -- 0-1; :SetText("12.4 / 80 MB") to override the auto "%" readout
 
 	-- every widget above shares this lifecycle: control:SetVisible(bool), control:SetEnabled(bool) (dims +
 	-- blocks input, doesn't just ignore the value), control:SetName(str), control:SetDescription(str) (no-op
 	-- on a widget with no label/description slot — Button/Label/Slider), control:Destroy() (tears down just
-	-- this row, unregisters its Flag).
+	-- this row, unregisters its Flag). Every control table also carries a `.Type` string (e.g. "Toggle",
+	-- "Slider") so host code can branch on widget kind without inspecting method signatures.
 	speedSlider:SetEnabled(false) -- e.g. grey out until some other toggle turns the feature on
+	-- (in-app: clicking a slider's own value label turns it into a TextBox for typing an exact number)
 	modeDropdown:Refresh({"Walk", "Noclip", "Fly"}) -- Dropdown/MultiDropdown only: swap the option list live
+	Library:GetControl("Speed") -- same object as Library.Flags["Speed"], but warns on a typo'd/missing Flag
 
 	local Config = Tab:CreateSection({Title = "Config"}) -- groups widgets under one titled card
 	Config:CreateConfigManager() -- [Save Config][name box], [Load Config][selection box] (flyout of saved configs)
@@ -564,6 +570,15 @@ function Library:DeleteConfig(name)
 		return false, "delfile failed: " .. tostring(err)
 	end
 	return true
+end
+
+-- Look up a control by its Flag name. Returns the control table (or nil if not found, with a warning).
+function Library:GetControl(flagName)
+	local control = self.Flags[flagName]
+	if not control then
+		warn("[iOSRobloxUILib] GetControl: no control registered under Flag '" .. tostring(flagName) .. "'")
+	end
+	return control
 end
 
 -- ---- toast notifications ----
@@ -1501,7 +1516,7 @@ function TabMeta:CreateLabel(config)
 	themed(label, "TextColor3", "TextSecondary")
 	-- A Label has no separate "name" concept — `SetName` retargets its own displayed text, same field
 	-- `config.Text` set it from. No description slot (it IS the text), so `SetDescription` is a no-op.
-	return attachLifecycle({}, row, disableOverlay, label, nil, nil, nil)
+	return attachLifecycle({ Type = "Label" }, row, disableOverlay, label, nil, nil, nil)
 end
 
 -- Groups related widgets under one titled card (e.g. "Theme", "Config") instead of them sitting as loose
@@ -1562,11 +1577,128 @@ function TabMeta:CreateSection(config)
 	})
 
 	return setmetatable({
+		Type = "Section",
 		Window = self.Window,
 		Page = body,
 		RowCount = 0,
 		FlatRows = true,
 	}, TabMeta)
+end
+
+-- Minimal 1px visual separator between widget groups in a tab — cheaper than a full CreateSection when
+-- all you want is a break in the list, not a titled card. No labelBlock, no DisabledOverlay: a divider has
+-- no "enabled/disabled" state, so SetEnabled would be meaningless and is deliberately not provided (only
+-- SetVisible/Destroy, per spec).
+function TabMeta:CreateDivider(config)
+	config = config or {}
+	self.RowCount += 1
+	local line = new("Frame", {
+		Name = "Divider" .. self.RowCount,
+		Size = UDim2.new(1, 0, 0, 1),
+		BackgroundColor3 = Colors.BorderSubtle,
+		BackgroundTransparency = 0.5,
+		BorderSizePixel = 0,
+		LayoutOrder = self.RowCount,
+		Parent = self.Page,
+	})
+	themed(line, "BackgroundColor3", "BorderSubtle")
+
+	return {
+		Type = "Divider",
+		SetVisible = function(_, visible)
+			line.Visible = visible
+		end,
+		Destroy = function()
+			line:Destroy()
+		end,
+	}
+end
+
+-- Display-only progress bar (0 to 1 fraction). No Flag (not an interactive input).
+-- Supports :SetProgress(fraction, animate), :SetText(overrideText), :GetProgress(), plus standard lifecycle.
+function TabMeta:CreateProgressBar(config)
+	config = config or {}
+	local name = config.Name or "Progress"
+	local current = math.clamp(config.CurrentValue or config.Progress or 0, 0, 1)
+
+	local row, disableOverlay = baseRow(self, 46)
+	local nameLabel = new("TextLabel", {
+		Font = Fonts.Body,
+		Text = name,
+		TextSize = 13,
+		TextColor3 = Colors.TextPrimary,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, -60, 0, 16),
+		Parent = row,
+	})
+	themed(nameLabel, "TextColor3", "TextPrimary")
+
+	local percentLabel = new("TextLabel", {
+		Font = Fonts.SubBody,
+		Text = config.Text or string.format("%d%%", math.floor(current * 100 + 0.5)),
+		TextSize = 11,
+		TextColor3 = Colors.TextSecondary,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, 0, 0, 0),
+		Size = UDim2.fromOffset(60, 16),
+		Parent = row,
+	})
+	themed(percentLabel, "TextColor3", "TextSecondary")
+
+	local track = new("Frame", {
+		Position = UDim2.fromOffset(0, 26),
+		Size = UDim2.new(1, 0, 0, 6),
+		BackgroundColor3 = Colors.BorderSubtle,
+		Parent = row,
+	})
+	themed(track, "BackgroundColor3", "BorderSubtle")
+	corner(track, Radius.Pill)
+
+	local fill = new("Frame", {
+		Size = UDim2.fromScale(current, 1),
+		BackgroundColor3 = Colors.AccentBlue,
+		Parent = track,
+	})
+	themed(fill, "BackgroundColor3", "AccentBlue")
+	corner(fill, Radius.Pill)
+
+	local customText = config.Text ~= nil
+
+	local control = {
+		Type = "ProgressBar",
+		SetProgress = function(_, fraction, animate)
+			fraction = math.clamp(tonumber(fraction) or 0, 0, 1)
+			current = fraction
+			if animate ~= false then
+				tween(fill, Motion.Press, { Size = UDim2.fromScale(fraction, 1) })
+			else
+				fill.Size = UDim2.fromScale(fraction, 1)
+			end
+			if not customText then
+				percentLabel.Text = string.format("%d%%", math.floor(fraction * 100 + 0.5))
+			end
+		end,
+		SetText = function(_, text)
+			if text then
+				customText = true
+				percentLabel.Text = tostring(text)
+			else
+				customText = false
+				percentLabel.Text = string.format("%d%%", math.floor(current * 100 + 0.5))
+			end
+		end,
+		GetProgress = function()
+			return current
+		end,
+	}
+
+	if config.Flag then
+		Library.Flags[config.Flag] = control
+	end
+	return attachLifecycle(control, row, disableOverlay, nameLabel, nil, nil, config.Flag)
 end
 
 function TabMeta:CreateToggle(config)
@@ -1620,6 +1752,7 @@ function TabMeta:CreateToggle(config)
 	end)
 
 	local control = {
+		Type = "Toggle",
 		-- fires the callback (unlike a purely-cosmetic Set) so LoadConfig actually re-applies the effect
 		-- (e.g. a restored "Fly Hack: true" really re-enables flying, not just flips the switch visually),
 		-- matching Slider/Dropdown's Set below which already call their callback.
@@ -1673,7 +1806,7 @@ function TabMeta:CreateButton(config)
 
 	-- A Button's "name" is its own centered label; no description slot (there's no room in a 36px button
 	-- row for one), so `SetDescription` is a documented no-op like Label's.
-	return attachLifecycle({}, row, disableOverlay, btnLabel, nil, nil, nil)
+	return attachLifecycle({ Type = "Button" }, row, disableOverlay, btnLabel, nil, nil, nil)
 end
 
 function TabMeta:CreateSlider(config)
@@ -1715,23 +1848,24 @@ function TabMeta:CreateSlider(config)
 		TextColor3 = Colors.TextPrimary,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		BackgroundTransparency = 1,
-		Size = UDim2.new(1, -40, 0, 16),
+		Size = UDim2.new(1, -60, 0, 16),
 		Parent = row,
 	})
 	themed(nameLabel, "TextColor3", "TextPrimary")
-	local valueLabel = new("TextLabel", {
+	local valueInput = new("TextBox", {
 		Font = Fonts.SubBody,
 		Text = tostring(value),
 		TextSize = 11,
 		TextColor3 = Colors.TextSecondary,
 		TextXAlignment = Enum.TextXAlignment.Right,
 		BackgroundTransparency = 1,
+		ClearTextOnFocus = false,
 		AnchorPoint = Vector2.new(1, 0),
 		Position = UDim2.new(1, 0, 0, 0),
-		Size = UDim2.fromOffset(40, 16),
+		Size = UDim2.fromOffset(50, 16),
 		Parent = row,
 	})
-	themed(valueLabel, "TextColor3", "TextSecondary")
+	themed(valueInput, "TextColor3", "TextSecondary")
 
 	local track = new("Frame", {
 		Position = UDim2.fromOffset(0, 26),
@@ -1761,9 +1895,23 @@ function TabMeta:CreateSlider(config)
 			or math.clamp(raw, min, max)
 		local drawAlpha = toAlpha(value)
 		tween(fill, Motion.Press, { Size = UDim2.fromScale(drawAlpha, 1) })
-		valueLabel.Text = tostring(value)
+		valueInput.Text = tostring(value)
 		task.spawn(callback, value)
 	end
+
+	valueInput.FocusLost:Connect(function()
+		local num = tonumber(valueInput.Text)
+		if num then
+			num = math.clamp(num, min, max)
+			if increment > 0 then
+				num = math.floor(num / increment + 0.5) * increment
+				num = math.clamp(num, min, max)
+			end
+			setFromAlpha(toAlpha(num))
+		else
+			valueInput.Text = tostring(value)
+		end
+	end)
 
 	local dragging = false
 
@@ -1796,6 +1944,7 @@ function TabMeta:CreateSlider(config)
 		end
 	end))
 	local control = {
+		Type = "Slider",
 		Set = function(_, v)
 			setFromAlpha(toAlpha(v))
 		end,
@@ -2000,6 +2149,7 @@ function TabMeta:CreateDropdown(config)
 	end)
 
 	local control = {
+		Type = "Dropdown",
 		Set = function(_, option)
 			-- `optLabels` is already keyed by every valid option string (built above alongside the option
 			-- buttons), so it doubles as a membership check for free. Without this, Set silently accepted
@@ -2123,6 +2273,7 @@ function TabMeta:CreateInput(config)
 	end)
 
 	local control = {
+		Type = "Input",
 		Set = function(_, value)
 			box.Text = tostring(value)
 			commit(false)
@@ -2224,6 +2375,7 @@ function TabMeta:CreateKeybind(config)
 	end))
 
 	local control = {
+		Type = "Keybind",
 		Set = function(_, keyName)
 			currentKey = safeKeyCode(keyName)
 			btnLabel.Text = currentKey and currentKey.Name or "None"
@@ -2553,6 +2705,7 @@ function TabMeta:CreateConfigManager(config)
 	-- still make sense (and are cheap), just applied to both rows instead of a labelBlock/disableOverlay
 	-- this widget never built.
 	return {
+		Type = "ConfigManager",
 		Refresh = rebuildRows,
 		SetVisible = function(_, visible)
 			saveRow.Visible = visible
@@ -2770,6 +2923,7 @@ function TabMeta:CreateMultiDropdown(config)
 	end
 
 	local control = {
+		Type = "MultiDropdown",
 		Set = function(_, optionsList)
 			-- `optionsList = optionsList or {}`: a nil argument (e.g. "clear every selection") used to
 			-- crash outright — `ipairs(nil)` throws, it doesn't just iterate zero times. Treating nil as
@@ -3096,6 +3250,7 @@ function TabMeta:CreateColorPicker(config)
 	end)
 
 	local control = {
+		Type = "ColorPicker",
 		Set = function(_, color)
 			hue, sat, val = color:ToHSV()
 			updateVisuals()
