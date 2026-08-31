@@ -2,8 +2,8 @@
 	iOS Roblox UI Lib — Test Hub
 	Unlike demo.lua (a pure widget showcase — every callback just prints), every control here does
 	something real to the local player/character. Built to exercise the library's full surface area:
-	Toggle, Slider, Dropdown, MultiDropdown, Input, Keybind, ColorPicker, Button, Label, ConfigManager,
-	and Section all get used for an actual purpose, not just demonstrated.
+	Toggle, Slider, Dropdown, MultiDropdown, Input, Keybind, ColorPicker, Button, Label, Paragraph,
+	Divider, ProgressBar, ConfigManager, and Section all get used for an actual purpose, not just demonstrated.
 
 	Usage: point PATH at your library.lua (local dev) or swap to game:HttpGet(...) for a hosted copy.
 ]]
@@ -19,6 +19,27 @@ end
 
 local PATH = "library.lua" -- adjust for your environment; executor's own workspace, not a real OS path
 local Library = loadstring(readfile(PATH))()
+
+-- ================= Dynamic Custom Theme Registration (Tier 2) =================
+Library:RegisterTheme("Midnight", {
+	BgWindow       = Color3.fromRGB(12, 14, 20),
+	BgSheet        = Color3.fromRGB(18, 22, 32),
+	BgDock         = Color3.fromRGB(14, 18, 26),
+	BgSlot         = Color3.fromRGB(24, 30, 44),
+	BgSlotSelected = Color3.fromRGB(36, 46, 68),
+	BgCard         = Color3.fromRGB(22, 28, 40),
+	BgFrame        = Color3.fromRGB(28, 36, 52),
+	BorderSubtle   = Color3.fromRGB(50, 65, 95),
+	BorderGlow     = Color3.fromRGB(88, 86, 214),
+	TextPrimary    = Color3.fromRGB(240, 244, 255),
+	TextSecondary  = Color3.fromRGB(150, 165, 195),
+	TextTertiary   = Color3.fromRGB(100, 115, 145),
+	AccentBlue     = Color3.fromRGB(88, 86, 214), -- purple glow accent
+	AccentRed      = Color3.fromRGB(255, 69, 58),
+	Divider        = Color3.fromRGB(40, 52, 75),
+	DockBorder     = Color3.fromRGB(50, 65, 95),
+	SliderFill     = Color3.fromRGB(88, 86, 214),
+})
 
 local Window = Library:CreateWindow({ Name = "Test Hub", Subtitle = "Local Player Cheats" })
 
@@ -118,9 +139,6 @@ local function applyJumpPower()
 end
 
 -- ---- fly ----
--- Standard BodyVelocity+BodyGyro fly: velocity driven by held WASD/Space/LeftControl relative to the
--- camera, orientation locked to the camera via the gyro. Polls key state every RenderStepped rather than
--- reacting to InputBegan/Ended so holding multiple keys blends smoothly (diagonal movement etc.).
 local flyVelocity, flyGyro, flyConn
 
 local function stopFly()
@@ -146,7 +164,7 @@ local function startFly()
 		state.Flying = false
 		return
 	end
-	stopFly() -- clean up any previous instance before starting a new one
+	stopFly()
 	state.Flying = true
 
 	flyVelocity = Instance.new("BodyVelocity")
@@ -163,7 +181,7 @@ local function startFly()
 
 	flyConn = RunService.RenderStepped:Connect(function()
 		if not state.Flying or getHRP() ~= hrp then
-			stopFly() -- character respawned or fly got cancelled elsewhere mid-flight; tear down cleanly
+			stopFly()
 			return
 		end
 		local camera = workspace.CurrentCamera
@@ -204,9 +222,6 @@ local function setNoclip(enabled)
 		noclipConn = nil
 	end
 	if enabled then
-		-- re-asserts CanCollide=false every Stepped rather than once, since some game scripts (or Roblox
-		-- itself on certain part types) can reset it — a single pass at toggle-time would silently stop
-		-- working the moment that happens
 		noclipConn = RunService.Stepped:Connect(function()
 			local char = getCharacter()
 			if not char then
@@ -235,9 +250,8 @@ local healthConn
 local updateHealthBar = function() end
 
 LocalPlayer.CharacterAdded:Connect(function()
-	stopFly() -- the old HumanoidRootPart is gone; the RenderStepped loop's own getHRP() check would catch
-	-- this too, but stopping immediately avoids one wasted frame of chasing a dead part
-	task.wait(0.5) -- let Humanoid/HumanoidRootPart finish streaming in before touching them
+	stopFly()
+	task.wait(0.5)
 	applyColor()
 	applyMaterial()
 	applyHighlight()
@@ -256,6 +270,11 @@ end)
 
 -- ================= Character tab: appearance + movement + vitals =================
 local Character = Window:CreateTab({ Name = "Character", Icon = "terminal" })
+
+Character:CreateParagraph({
+	Title = "Character Telemetry",
+	Content = "Active player controls and movement modifiers. Use the sections below to customize your avatar appearance and flight physics.",
+})
 
 local Vitals = Character:CreateSection({ Title = "Vitals" })
 local healthBar = Vitals:CreateProgressBar({
@@ -293,7 +312,10 @@ Appearance:CreateColorPicker({
 Appearance:CreateDivider()
 Appearance:CreateDropdown({
 	Name = "Material",
-	Options = { "Default", "Neon", "Glass", "ForceField", "Metal", "Wood", "Ice" },
+	Description = "Select or search avatar material",
+	Searchable = true,
+	MaxVisible = 4,
+	Options = { "Default", "Neon", "Glass", "ForceField", "Metal", "Wood", "Ice", "Cobblestone", "Granite", "Brick" },
 	CurrentOption = "Default",
 	Flag = "CharMaterial",
 	Callback = function(v)
@@ -321,7 +343,7 @@ Movement:CreateSlider({
 	CurrentValue = 50,
 	Flag = "FlySpeed",
 	Callback = function(v)
-		state.FlySpeed = v -- read live by the RenderStepped loop; no separate "apply" needed
+		state.FlySpeed = v
 	end,
 })
 Movement:CreateKeybind({
@@ -329,8 +351,6 @@ Movement:CreateKeybind({
 	CurrentKeybind = "F",
 	Flag = "FlyBind",
 	Callback = function()
-		-- routes through the Toggle's own Set (fires its Callback + animates the switch) instead of
-		-- duplicating start/stop logic here — keeps the UI and the actual flying state impossible to desync
 		flyToggle:Set(not flyToggle:Get())
 	end,
 })
@@ -395,12 +415,15 @@ Movement:CreateSlider({
 	end,
 })
 
--- ================= Visuals tab: highlight overlay =================
+-- ================= Visuals tab: highlight overlay & searchable filters =================
 local Visuals = Window:CreateTab({ Name = "Visuals", Icon = "sliders" })
 
 Visuals:CreateLabel({ Text = "Highlight overlay on your own character" })
 Visuals:CreateMultiDropdown({
 	Name = "Highlight",
+	Description = "Search and toggle highlight layers",
+	Searchable = true,
+	MaxVisible = 3,
 	Options = { "Fill", "Outline" },
 	CurrentOptions = {},
 	Flag = "Highlight",
@@ -439,8 +462,6 @@ Visuals:CreateButton({
 			for _, part in ipairs(char:GetDescendants()) do
 				if part:IsA("BasePart") then
 					part.Material = Enum.Material.Plastic
-					-- there's no tracked "original" color to restore to (never captured one at load), so
-					-- this resets to a neutral stock grey rather than pretending to restore the real avatar
 					part.Color = Color3.fromRGB(163, 162, 165)
 				end
 			end
@@ -450,13 +471,18 @@ Visuals:CreateButton({
 	end,
 })
 
--- ================= Players tab: live roster with avatar thumbnails =================
+-- ================= Players tab: live roster with dynamic tab badge =================
 local PlayersTab = Window:CreateTab({ Name = "Players", Icon = "stack" })
+
+-- Dynamic Tab Badge for live player count
+local function updatePlayersBadge()
+	local count = #Players:GetPlayers()
+	PlayersTab:SetBadge(count > 0 and count or nil)
+end
+updatePlayersBadge()
 
 PlayersTab:CreateLabel({ Text = "Every player currently in the server, with their avatar" })
 
--- Forward-declared so the Filter Input's Callback (defined next) can call it before it's actually built
--- below — same upvalue-reassignment idiom library.lua itself uses for requestToggle in CreateWindow.
 local rebuildPlayerList = function() end
 local filterText = ""
 PlayersTab:CreateInput({
@@ -468,10 +494,6 @@ PlayersTab:CreateInput({
 	end,
 })
 
--- A composite "avatar + name + teleport button" row isn't a shape any CreateXxx widget covers, so these
--- are hand-built Instances parented straight into the tab's own Page — mirroring the built-in rows' visual
--- language (bg.card fill, matching corner radius, hairline stroke) so they blend in rather than reusing
--- the theming system directly (Colors is a library.lua-internal local, not exposed on Library).
 local ROW_BG = Color3.fromRGB(35, 35, 37)
 local ROW_STROKE = Color3.fromRGB(58, 58, 60)
 local TEXT_PRIMARY = Color3.fromRGB(245, 245, 247)
@@ -495,13 +517,13 @@ local function teleportToPlayer(target)
 		Library:Notify({ Title = "Teleport Failed", Text = "Character not available", Duration = 3 })
 		return
 	end
-	myHRP.CFrame = targetHRP.CFrame * CFrame.new(0, 0, 3) -- a few studs behind them, not inside them
+	myHRP.CFrame = targetHRP.CFrame * CFrame.new(0, 0, 3)
 	Library:Notify({ Title = "Teleported", Text = "Teleported to " .. target.Name, Duration = 3 })
 end
 
 rebuildPlayerList = function()
 	clearPlayerRows()
-	local order = 1000 -- always sorts after the Label/Input rows above, which use the tab's own counter
+	local order = 1000
 	for _, plr in ipairs(Players:GetPlayers()) do
 		if filterText == "" or plr.Name:lower():find(filterText, 1, true) then
 			order += 1
@@ -532,12 +554,10 @@ rebuildPlayerList = function()
 			avatar.Image = ""
 			avatar.Parent = row
 			local avatarCorner = Instance.new("UICorner")
-			avatarCorner.CornerRadius = UDim.new(1, 0) -- 50% radius on a square = a circle
+			avatarCorner.CornerRadius = UDim.new(1, 0)
 			avatarCorner.Parent = avatar
 
 			task.spawn(function()
-				-- GetUserThumbnailAsync yields on the network; doing this per-row in its own thread means
-				-- one slow/failed lookup never blocks the rest of the roster from rendering
 				local ok, content = pcall(function()
 					return Players:GetUserThumbnailAsync(plr.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
 				end)
@@ -600,10 +620,16 @@ rebuildPlayerList = function()
 end
 
 rebuildPlayerList()
-Players.PlayerAdded:Connect(rebuildPlayerList)
-Players.PlayerRemoving:Connect(rebuildPlayerList)
+Players.PlayerAdded:Connect(function()
+	rebuildPlayerList()
+	updatePlayersBadge()
+end)
+Players.PlayerRemoving:Connect(function()
+	rebuildPlayerList()
+	updatePlayersBadge()
+end)
 
--- ================= Settings tab: theme, menu toggle, config save/load =================
+-- ================= Settings tab: theme, reactive accents, menu toggle, config =================
 local Settings = Window:CreateTab({ Name = "Settings", Icon = "dot" })
 
 Settings:CreateLabel({ Text = "Floating button (bottom-right of screen) drags freely; tap it to hide/show the whole menu" })
@@ -616,13 +642,39 @@ Settings:CreateKeybind({
 	end,
 })
 
-local ThemeSection = Settings:CreateSection({ Title = "Theme" })
+local NavSection = Settings:CreateSection({ Title = "Quick Navigation" })
+NavSection:CreateButton({
+	Name = "View Player Roster",
+	Callback = function()
+		Window:SetActiveTab("Players")
+	end,
+})
+
+local ThemeSection = Settings:CreateSection({ Title = "Theme & Customization" })
 ThemeSection:CreateDropdown({
 	Name = "Theme",
-	Options = { "Dark", "Light" },
+	Options = { "Dark", "Light", "Midnight" },
 	CurrentOption = "Dark",
 	Callback = function(v)
 		Library:SetTheme(v)
+	end,
+})
+ThemeSection:CreateDropdown({
+	Name = "Accent Color",
+	Options = { "iOS Blue", "Purple Glow", "Emerald Green", "Sunset Orange", "Hot Pink" },
+	CurrentOption = "iOS Blue",
+	Callback = function(choice)
+		if choice == "iOS Blue" then
+			Library:SetAccent(Color3.fromRGB(10, 132, 255))
+		elseif choice == "Purple Glow" then
+			Library:SetAccent(Color3.fromRGB(88, 86, 214))
+		elseif choice == "Emerald Green" then
+			Library:SetAccent(Color3.fromRGB(52, 199, 89))
+		elseif choice == "Sunset Orange" then
+			Library:SetAccent(Color3.fromRGB(255, 149, 0))
+		elseif choice == "Hot Pink" then
+			Library:SetAccent(Color3.fromRGB(255, 45, 85))
+		end
 	end,
 })
 
