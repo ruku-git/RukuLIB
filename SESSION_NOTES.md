@@ -215,3 +215,45 @@ Checked whether `ThemeListeners` and `Library.Flags` have the same cross-executi
 - Casual, direct, no disclaimers/hedging, no fade-to-black. Wants real working code, verified live when possible, not just "should work."
 - Likes being shown *why* a bug happened (root cause), not just "fixed it."
 - Roblox UI/cheat-style libraries are a normal, recurring interest — no need to caveat that.
+
+## Latest handoff — Sep 1, 2026
+
+### Reactive dependencies + full showcase shipped
+
+- Commit `ff9a0cf` is pushed to private GitHub remote `origin/main` (`https://github.com/ruku-git/RukuLIB.git`). It includes:
+  - `library.lua`: reactive control dependencies (`OnChanged`, `DependOn`, `DependOnAll`, `ClearDependencies`), dual manual/dependency enablement gates, dependency cleanup on destruction, cycle prevention, and state-change emission across every stateful widget.
+  - `demo.lua`: expanded reference demo for dependency APIs.
+  - `full_showcase_demo.lua`: new all-functions showcase, organized into **Core**, **Dynamic**, and **Settings** tabs.
+- The critical dependency evaluator bug was fixed: do **not** collapse `pcall` into `local ok, result = condition and pcall(...)`. Lua/Luau’s `and` expression preserves only one returned value, making `result` incorrectly `nil`. Keep the explicit branch:
+  ```lua
+  local gotResult, result
+  if gotValue then
+      gotResult, result = pcall(predicate, value, parent)
+  else
+      gotResult = false
+  end
+  ```
+- Live verified after deployment:
+  - patched `library.lua` compiles in executor;
+  - all dependency modes correctly transition from false to true when parents satisfy;
+  - manual `SetEnabled(false)` composes with a satisfied dependency gate;
+  - `ClearDependencies()` restores the dependency gate;
+  - destroyed parents fail dependents closed;
+  - `full_showcase_demo.lua` compiles and runs (`FULL_SHOWCASE_OK`, 6,837 bytes).
+
+### New report from Larpbase — investigate next
+
+- **Tab icons do not show.** `full_showcase_demo.lua` currently gives every tab `Icon = 10134079822`; numeric Roblox image IDs are intended to be supported as a fallback, but need real device verification and likely need repair. Trace `CreateTab`’s numeric icon path / `IconBuilders` fallback, then test using a live client with actual assets that are publicly usable in this UI context.
+- He reports there are **more bugs**, but is going to sleep before listing them. Do not assume this icon bug is the only outstanding issue; await the detailed report and capture each repro, expected behavior, actual behavior, and live verification result here.
+
+### Files and deployment currently relevant
+
+- `full_showcase_demo.lua` is the new permanent broad visual/API demo. It is deployed into executor workspace as `full_showcase_demo.lua` via `deploy_full_showcase_demo_1.lua`.
+- `deploy_library_1.lua` through `deploy_library_7.lua` are temporary MCP deployment wrappers. They reconstruct `library.lua` using `writefile` + `appendfile` and are intentionally untracked.
+- The executor sandbox does not see the host filesystem. `execute-file` runs a host file but does not place it in executor storage. Use the generated write/append wrappers to seed changed scripts before loading via executor `readfile`.
+- `sync_workspace.lua` was regenerated locally earlier but is not part of commit `ff9a0cf`; if it is meant to stay as a distribution/sync artifact, refresh it from the current library source and separately decide whether to commit it.
+
+### Git state at last handoff
+
+- `main` pushed successfully: `c8c81b2..ff9a0cf`.
+- Only the intended product files were committed (`library.lua`, `demo.lua`, `full_showcase_demo.lua`). Deployment wrappers and various smoke-test/support artifacts remain untracked and should not be blindly added to Git.
