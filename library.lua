@@ -344,6 +344,41 @@ IconBuilders.dot = function(parent, color) -- fallback: neutral marker
 	return canvas
 end
 
+IconBuilders.gear = function(parent, color) -- Settings: compact hand-built cog
+	local canvas = iconCanvas(parent)
+	for i = 0, 7 do
+		local angle = math.rad(i * 45)
+		local tooth = new("Frame", {
+			Size = UDim2.fromOffset(3, 5),
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0.5, math.sin(angle) * 5.5, 0.5, -math.cos(angle) * 5.5),
+			Rotation = i * 45,
+			BackgroundColor3 = color,
+			BorderSizePixel = 0,
+			Parent = canvas,
+		})
+	end
+	local ring = new("Frame", {
+		Size = UDim2.fromOffset(11, 11),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		BackgroundColor3 = color,
+		BorderSizePixel = 0,
+		Parent = canvas,
+	})
+	corner(ring, Radius.Pill)
+	local cutout = new("Frame", {
+		Size = UDim2.fromOffset(5, 5),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		BackgroundColor3 = Colors.BgDock,
+		BorderSizePixel = 0,
+		Parent = ring,
+	})
+	corner(cutout, Radius.Pill)
+	return canvas
+end
+
 -- iconConfig: nil -> dot fallback | number -> rbxassetid image | string -> named vector glyph
 local function buildIcon(parent, iconConfig, color)
 	if typeof(iconConfig) == "number" then
@@ -1661,12 +1696,16 @@ local function baseRow(tab, height)
 	-- CreateWindow's own comment on why), so an explicit ZIndex wins over insertion order either way.
 	-- Active=true so it actually eats clicks/drags meant for the row's real controls while shown; Visible
 	-- starts false so a control that's never disabled pays nothing beyond one extra idle Instance.
-	local disableOverlay = new("Frame", {
+	-- A GuiButton reliably consumes mouse/touch input; an Active Frame can still leak
+	-- activation to controls underneath on some Roblox input paths.
+	local disableOverlay = new("TextButton", {
 		Name = "DisabledOverlay",
 		Size = UDim2.fromScale(1, 1),
 		BackgroundColor3 = Colors.BgBase,
 		BackgroundTransparency = 0.45,
 		Active = true,
+		AutoButtonColor = false,
+		Text = "",
 		Visible = false,
 		ZIndex = 5,
 		Parent = row,
@@ -1894,8 +1933,37 @@ local function attachLifecycle(control, row, disableOverlay, titleLabel, descLab
 		return control
 	end
 
+	local visibleAnimationGen = 0
+	local rowHeight = row.Size.Y.Offset
 	control.SetVisible = function(_, visible)
+		visibleAnimationGen += 1
 		row.Visible = visible
+		row.Size = UDim2.new(1, 0, 0, rowHeight)
+	end
+	-- Opt-in row transition for conditional controls: UIListLayout sees the height tween and shifts
+	-- following rows with it, while the generation counter makes rapid state changes deterministic.
+	control.SetVisibleAnimated = function(_, visible)
+		visibleAnimationGen += 1
+		local myGen = visibleAnimationGen
+		if visible then
+			row.Visible = true
+			row.Size = UDim2.new(1, 0, 0, 0)
+			tween(row, Motion.Tab, { Size = UDim2.new(1, 0, 0, rowHeight) })
+		else
+			if not row.Visible then
+				return
+			end
+			local closeTween = tween(row, Motion.Tab, { Size = UDim2.new(1, 0, 0, 0) })
+			closeTween.Completed:Connect(function(state)
+				if state == Enum.PlaybackState.Completed and myGen == visibleAnimationGen then
+					row.Visible = false
+					row.Size = UDim2.new(1, 0, 0, rowHeight)
+				end
+			end)
+		end
+	end
+	control.__IsEnabled = function()
+		return not control.__destroyed and control.__manualEnabled and control.__dependencyEnabled
 	end
 	control.SetEnabled = function(_, enabled)
 		control.__manualEnabled = enabled == true
@@ -2455,19 +2523,26 @@ function TabMeta:CreateButton(config)
 	})
 	themed(btnLabel, "TextColor3", "AccentBlue")
 
+	local control = { Type = "Button" }
 	btn.MouseButton1Down:Connect(function()
-		tween(row, Motion.Press, { BackgroundTransparency = 0.2 })
+		if control.__IsEnabled and control:__IsEnabled() then
+			tween(row, Motion.Press, { BackgroundTransparency = 0.2 })
+		end
 	end)
 	btn.MouseButton1Up:Connect(function()
-		tween(row, Motion.Hover, { BackgroundTransparency = 0.5 })
+		if control.__IsEnabled and control:__IsEnabled() then
+			tween(row, Motion.Hover, { BackgroundTransparency = 0.5 })
+		end
 	end)
 	btn.MouseButton1Click:Connect(function()
-		task.spawn(callback)
+		if control.__IsEnabled and control:__IsEnabled() then
+			task.spawn(callback)
+		end
 	end)
 
 	-- A Button's "name" is its own centered label; no description slot (there's no room in a 36px button
 	-- row for one), so `SetDescription` is a documented no-op like Label's.
-	return attachLifecycle({ Type = "Button" }, row, disableOverlay, btnLabel, nil, nil, nil)
+	return attachLifecycle(control, row, disableOverlay, btnLabel, nil, nil, nil)
 end
 
 function TabMeta:CreateSlider(config)
@@ -2567,6 +2642,10 @@ function TabMeta:CreateSlider(config)
 	end
 
 	valueInput.FocusLost:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			valueInput.Text = tostring(value)
+			return
+		end
 		local num = tonumber(valueInput.Text)
 		if num then
 			num = math.clamp(num, min, max)
@@ -2595,6 +2674,9 @@ function TabMeta:CreateSlider(config)
 	-- same here means `x`/`y` (GuiButton.MouseButton1Down's own params, screen pixels) feed straight into
 	-- the same alpha math InputChanged uses below instead of duplicating it.
 	trackButton.MouseButton1Down:Connect(function(x, y)
+		if not (control and control.__IsEnabled and control:__IsEnabled()) then
+			return
+		end
 		dragging = true
 		local relX = (x - track.AbsolutePosition.X) / track.AbsoluteSize.X
 		setFromAlpha(relX)
@@ -2605,7 +2687,8 @@ function TabMeta:CreateSlider(config)
 		end
 	end))
 	trackConnection(UserInputService.InputChanged:Connect(function(input)
-		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		if dragging and control and control.__IsEnabled and control:__IsEnabled()
+			and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
 			local relX = (input.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X
 			setFromAlpha(relX)
 		end
@@ -2905,7 +2988,9 @@ function TabMeta:CreateDropdown(config)
 	local sheetResizeConn = sheet:GetPropertyChangedSignal("AbsoluteSize"):Connect(reposition)
 
 	btn.MouseButton1Click:Connect(function()
-		setOpen(not open)
+		if control and control.__IsEnabled and control:__IsEnabled() then
+			setOpen(not open)
+		end
 	end)
 
 	control = {

@@ -253,6 +253,19 @@ Checked whether `ThemeListeners` and `Library.Flags` have the same cross-executi
 - The executor sandbox does not see the host filesystem. `execute-file` runs a host file but does not place it in executor storage. Use the generated write/append wrappers to seed changed scripts before loading via executor `readfile`.
 - `sync_workspace.lua` was regenerated locally earlier but is not part of commit `ff9a0cf`; if it is meant to stay as a distribution/sync artifact, refresh it from the current library source and separately decide whether to commit it.
 
+### September 1 follow-up — disabled controls and Fly Hack reveal polish
+
+- **Disabled controls were visually dimmed but still interactive.** `baseRow()` used an `Active` `Frame` as `DisabledOverlay`; on this client, some input paths still delivered interaction to controls under that frame. Replaced it with a transparent, active `TextButton` at the same Z-index so it reliably consumes mouse/touch input.
+- Added lifecycle-level `control:__IsEnabled()` and defensive event guards:
+  - disabled Buttons no longer animate or run callbacks;
+  - disabled Sliders reject track clicks, drag updates, and typed value commits;
+  - disabled Dropdowns cannot open their flyouts.
+- **Live direct-handler verification:** while dependencies were unsatisfied, a slider remained at `0` with zero callbacks and a button’s callback count stayed `0`; after enabling their parents, the slider reached `100` with one callback and the button fired once.
+- **Fly Hack showcase behavior:** `Speed` now starts fully hidden while Fly Hack is off, remains dependency-disabled as an independent safety gate, then appears when Fly Hack turns on and hides again when it turns off.
+- Added public opt-in `control:SetVisibleAnimated(bool)` to lifecycle-backed controls. It tweens the row height through the existing `UIListLayout` so following rows shift smoothly. A generation guard handles rapid toggle sequences without stale completion callbacks hiding the current row.
+  - Live animation probe: enable transitioned `0 → 39 → 46px`; disable transitioned `46 → 6 → hidden`; rapid off/on sequences settled at the correct `visible=true`, `46px` state.
+- Regenerated `sync_workspace.lua`, deployed `library.lua` and `full_showcase_demo.lua` to executor storage, and confirmed `FULL_SHOWCASE_SMOKE_OK` with no new library errors. Temporary smoke/deployment wrappers were removed afterward.
+
 ### Git state at last handoff
 
 - `main` pushed successfully: `c8c81b2..ff9a0cf`.

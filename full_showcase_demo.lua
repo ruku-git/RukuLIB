@@ -10,7 +10,7 @@ local window = lib:CreateWindow({
 -- ==========================================
 -- TAB 1: CORE WIDGETS
 -- ==========================================
-local coreTab = window:CreateTab({ Name = "Core", Icon = 10134079822 }) -- a generic icon id
+local coreTab = window:CreateTab({ Name = "Core", Icon = "dot" })
 coreTab:SetBadge("New")
 
 local labelSec = coreTab:CreateSection({ Title = "Text & Decor" })
@@ -55,13 +55,19 @@ local speedSlider = widgetsSec:CreateSlider({
     Flag = "WalkSpeed",
     Callback = function(val) end
 })
--- Speed depends on Fly
+-- Speed is both disabled and hidden until Fly Hack is enabled.
 speedSlider:DependOn(flyToggle)
+flyToggle:OnChanged(function(enabled)
+    speedSlider:SetVisibleAnimated(enabled == true)
+end)
+-- Toggle's constructor fires its default callback before external listeners can subscribe,
+-- so the showcase starts hidden explicitly and thereafter follows the change listener.
+speedSlider:SetVisible(false)
 
 local modeDropdown = widgetsSec:CreateDropdown({
     Name = "Attack Mode",
     Options = {"Melee", "Ranged", "Magic"},
-    Default = "Melee",
+    CurrentOption = "Melee",
     Flag = "AttackMode",
     Callback = function(val) end
 })
@@ -101,12 +107,12 @@ widgetsSec:CreateColorPicker({
 -- ==========================================
 -- TAB 2: DEPENDENCIES & DYNAMICS
 -- ==========================================
-local depTab = window:CreateTab({ Name = "Dynamic", Icon = 10134079822 })
+local depTab = window:CreateTab({ Name = "Dynamic", Icon = "sliders" })
 
 local reactiveSec = depTab:CreateSection({ Title = "Reactive Dependencies" })
 
 local masterSwitch = reactiveSec:CreateToggle({ Name = "Master Switch", Default = false })
-local modeSwitch = reactiveSec:CreateDropdown({ Name = "Mode", Options = {"Basic", "Pro", "God"}, Default = "Basic" })
+local modeSwitch = reactiveSec:CreateDropdown({ Name = "Mode", Options = {"Basic", "Pro", "God"}, CurrentOption = "Basic" })
 
 local dependentButton = reactiveSec:CreateButton({
     Name = "Pro/God Ability",
@@ -177,7 +183,7 @@ mutateSec:CreateMultiDropdown({
 -- ==========================================
 -- TAB 3: SETTINGS & LIFECYCLE
 -- ==========================================
-local settingsTab = window:CreateTab({ Name = "Settings", Icon = 10134079822 })
+local settingsTab = window:CreateTab({ Name = "Settings", Icon = "gear" })
 
 local themeSec = settingsTab:CreateSection({ Title = "Appearance" })
 
