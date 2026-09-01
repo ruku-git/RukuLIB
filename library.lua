@@ -165,6 +165,11 @@ end
 -- lazily (skipped, not removed) if their instance is gone — fine for a UI library's lifetime.
 local ThemeListeners = {}
 
+-- Every lifecycle-attached control is registered weakly so full window teardown can invalidate
+-- dependency graphs even when the host script still holds a reference to an old control table.
+local ControlRegistry = setmetatable({}, { __mode = "k" })
+local clearControlDependencies
+
 local function onTheme(fn)
 	table.insert(ThemeListeners, fn)
 	return fn
@@ -752,12 +757,20 @@ WindowMeta.__index = WindowMeta
 local TabMeta = {}
 TabMeta.__index = TabMeta
 
+-- Defined after attachLifecycle so it can call each control's cleanup method, but CreateWindow is defined
+-- earlier in this source. Install a harmless no-op now; attachLifecycle replaces it before any public
+-- CreateWindow call can run.
+clearControlDependencies = function() end
+
 function Library:CreateWindow(config)
 	config = config or {}
 	local windowName = config.Name or "Window"
 	local subtitle = config.Subtitle or ""
 
 	local guiParent = getGuiParent()
+	-- Invalidate retained control tables before tearing down their rows/flyouts, so relationship cleanup
+	-- never tries to repaint an Instance that has already been destroyed.
+	clearControlDependencies()
 	for _, child in ipairs(guiParent:GetChildren()) do
 		if child.Name == "IOSRobloxUILib" then
 			child:Destroy() -- re-running CreateWindow (e.g. re-executing the script) replaces, never stacks
@@ -1236,6 +1249,7 @@ end
 -- touch the independent Notify toast layer, which is deliberately decoupled from any Window's lifecycle.
 function Library:Destroy()
 	clearGlobalConnections()
+	clearControlDependencies()
 	ThemeListeners = {}
 	self.Flags = {}
 	local guiParent = getGuiParent()
@@ -1699,21 +1713,193 @@ local function labelBlock(row, title, desc)
 end
 
 -- Shared lifecycle every widget's returned control table gets, attached in one place instead of
--- reimplemented per-`CreateXxx`: `SetVisible` (show/hide the whole row), `SetEnabled` (toggle baseRow's
--- own DisabledOverlay — no per-widget disable logic needed), `SetName`/`SetDescription` (retarget whatever
--- labelBlock built, lazily creating a description label if the widget started without one), `Destroy` (tear
--- down just this one row, and drop it from `Library.Flags` if it was flagged, without touching the rest of
--- the window). `descParent` is the container a lazily-created description label should be parented into
--- (labelBlock's `block`, or nil for a widget with no label-block concept — Button/Label/Slider — in which
--- case `SetDescription` is a documented no-op rather than a crash).
+-- reimplemented per-`CreateXxx`. Besides the visual lifecycle, it owns the dependency graph: public
+-- SetEnabled tracks host intent, while dependency state is a second gate, so a parent transition can never
+-- undo a manual disable. Every attached control receives OnChanged, DependOn, DependOnAll, and
+-- ClearDependencies; controls without Get simply cannot be dependency sources.
 local function attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, descParent, flagName)
+	local function applyEnabledState()
+		local enabled = control.__manualEnabled and control.__dependencyEnabled
+		if disableOverlay and disableOverlay.Parent then
+			disableOverlay.Visible = not enabled
+		end
+	end
+
+	local function evaluateDependencies()
+		if control.__destroyed then
+			return
+		end
+		local satisfied = control.__failedDependencyCount == 0
+		if satisfied then
+			for parent, predicate in pairs(control.__dependencySources) do
+				local gotValue, value = pcall(parent.Get, parent)
+				local gotResult, result
+					if gotValue then
+						gotResult, result = pcall(predicate, value, parent)
+					else
+						gotResult = false
+					end
+				if not gotResult or result ~= true then
+					satisfied = false
+					break
+				end
+			end
+		end
+		control.__dependencyEnabled = satisfied
+		applyEnabledState()
+	end
+
+	local function removeDependency(parent)
+		if control.__dependencySources[parent] then
+			control.__dependencySources[parent] = nil
+			if parent.__dependencyDependents then
+				parent.__dependencyDependents[control] = nil
+			end
+		end
+	end
+
+	local function reaches(start, target, visited)
+		if start == target then
+			return true
+		end
+		visited = visited or {}
+		if visited[start] then
+			return false
+		end
+		visited[start] = true
+		for child in pairs(start.__dependencyDependents or {}) do
+			if not child.__destroyed and reaches(child, target, visited) then
+				return true
+			end
+		end
+		return false
+	end
+
+	control.__manualEnabled = true
+	control.__dependencyEnabled = true
+	control.__dependencySources = {}
+	control.__dependencyDependents = {}
+	control.__failedDependencyCount = 0
+	control.__changeListeners = {}
+	control.__destroyed = false
+	ControlRegistry[control] = true
+
+	-- Constructors assign public Set/Get before lifecycle augmentation. Dependency support is added here
+	-- without replacing those control-specific accessors.
+	control.__EmitChanged = function(_, value)
+		if control.__destroyed then
+			return
+		end
+		for listener in pairs(control.__changeListeners) do
+			task.spawn(listener, value)
+		end
+		-- Value propagation is synchronous, so code immediately following parent:Set(...) sees every
+		-- dependent gate in its new state. Snapshot to tolerate a listener destroying a control mid-pass.
+		local dependents = {}
+		for dependent in pairs(control.__dependencyDependents) do
+			table.insert(dependents, dependent)
+		end
+		for _, dependent in ipairs(dependents) do
+			if not dependent.__destroyed and dependent.__EvaluateDependencies then
+				dependent:__EvaluateDependencies()
+			end
+		end
+	end
+	control.__EvaluateDependencies = function()
+		evaluateDependencies()
+	end
+
+	control.OnChanged = function(_, listener)
+		if type(listener) ~= "function" then
+			warn("[iOSRobloxUILib] OnChanged: listener must be a function")
+			return { Disconnect = function() end }
+		end
+		local connected = not control.__destroyed
+		if connected then
+			control.__changeListeners[listener] = true
+		end
+		return {
+			Disconnect = function()
+				if connected then
+					connected = false
+					control.__changeListeners[listener] = nil
+				end
+			end,
+		}
+	end
+
+	control.DependOn = function(_, parent, predicate)
+		if control.__destroyed then
+			return control
+		end
+		if type(parent) ~= "table" or parent.__destroyed or type(parent.Get) ~= "function" or type(parent.OnChanged) ~= "function" then
+			warn("[iOSRobloxUILib] DependOn: parent must be a live value control")
+			return control
+		end
+		if parent == control or reaches(control, parent) then
+			warn("[iOSRobloxUILib] DependOn: dependency cycle rejected")
+			return control
+		end
+		if predicate ~= nil and type(predicate) ~= "function" then
+			warn("[iOSRobloxUILib] DependOn: predicate must be a function")
+			return control
+		end
+		removeDependency(parent)
+		control.__dependencySources[parent] = predicate or function(value)
+			return value == true
+		end
+		parent.__dependencyDependents[control] = true
+		evaluateDependencies()
+		return control
+	end
+
+	control.DependOnAll = function(_, parents, predicate)
+		if type(parents) ~= "table" then
+			warn("[iOSRobloxUILib] DependOnAll: parents must be an array of controls")
+			return control
+		end
+		if predicate == nil then
+			for _, parent in ipairs(parents) do
+				control:DependOn(parent)
+			end
+			return control
+		end
+		if type(predicate) ~= "function" then
+			warn("[iOSRobloxUILib] DependOnAll: predicate must be a function")
+			return control
+		end
+		for _, parent in ipairs(parents) do
+			control:DependOn(parent, function()
+				local snapshot = {}
+				for i, source in ipairs(parents) do
+					local ok, current = pcall(source.Get, source)
+					if not ok then
+						return false
+					end
+					snapshot[i] = current
+				end
+				local ok, result = pcall(predicate, snapshot)
+				return ok and result == true
+			end)
+		end
+		return control
+	end
+
+	control.ClearDependencies = function()
+		for parent in pairs(control.__dependencySources) do
+			removeDependency(parent)
+		end
+		control.__failedDependencyCount = 0
+		evaluateDependencies()
+		return control
+	end
+
 	control.SetVisible = function(_, visible)
 		row.Visible = visible
 	end
 	control.SetEnabled = function(_, enabled)
-		if disableOverlay then
-			disableOverlay.Visible = not enabled
-		end
+		control.__manualEnabled = enabled == true
+		applyEnabledState()
 	end
 	control.SetName = function(_, name)
 		if titleLabel then
@@ -1745,12 +1931,51 @@ local function attachLifecycle(control, row, disableOverlay, titleLabel, descLab
 		end
 	end
 	control.Destroy = function()
+		if control.__destroyed then
+			return
+		end
+		control.__destroyed = true
+		for parent in pairs(control.__dependencySources) do
+			if parent.__dependencyDependents then
+				parent.__dependencyDependents[control] = nil
+			end
+		end
+		control.__dependencySources = {}
+		-- Snapshot the dependents before mutating graph tables. This makes destruction deterministic even
+		-- when a dependency update causes host code to destroy another control synchronously.
+		local dependents = {}
+		for dependent in pairs(control.__dependencyDependents) do
+			table.insert(dependents, dependent)
+		end
+		for _, dependent in ipairs(dependents) do
+			if not dependent.__destroyed then
+				-- A missing parent is an unsatisfied requirement; keep the edge's failure state rather
+				-- than silently re-enabling the child when its prerequisite is destroyed.
+				dependent.__dependencySources[control] = function()
+					return false
+				end
+				dependent.__failedDependencyCount += 1
+				dependent:__EvaluateDependencies()
+			end
+		end
+		control.__dependencyDependents = {}
+		control.__changeListeners = {}
+		ControlRegistry[control] = nil
 		if flagName and Library.Flags[flagName] == control then
 			Library.Flags[flagName] = nil
 		end
 		row:Destroy()
 	end
 	return control
+end
+
+clearControlDependencies = function()
+	for control in pairs(ControlRegistry) do
+		if not control.__destroyed then
+			control:Destroy()
+		end
+	end
+	ControlRegistry = setmetatable({}, { __mode = "k" })
 end
 
 -- Positions an Overlay-parented flyout (dropdown list, multi-dropdown list, color picker panel) relative
@@ -1928,23 +2153,24 @@ function TabMeta:CreateParagraph(config)
 		}
 	end
 
-	control.SetVisible = function(_, visible)
-		row.Visible = visible
-	end
-	control.SetEnabled = function(_, enabled)
-		disableOverlay.Visible = not enabled
-	end
-	control.Destroy = function()
-		if config.Flag and Library.Flags[config.Flag] == control then
-			Library.Flags[config.Flag] = nil
-		end
-		row:Destroy()
-	end
-
 	if config.Flag then
 		Library.Flags[config.Flag] = control
 	end
 
+	-- Paragraph keeps its richer SetTitle/SetContent/Set surface above; attach only the shared
+	-- lifecycle/dependency methods, then restore those paragraph-specific method aliases.
+	local setTitle = control.SetTitle
+	local setContent = control.SetContent
+	local set = control.Set
+	local get = control.Get
+	attachLifecycle(control, row, disableOverlay, titleLabel, nil, nil, config.Flag)
+	control.SetTitle = setTitle
+	control.SetName = setTitle
+	control.SetContent = setContent
+	control.SetText = setContent
+	control.SetDescription = setContent
+	control.Set = set
+	control.Get = get
 	return control
 end
 
@@ -2161,11 +2387,17 @@ function TabMeta:CreateToggle(config)
 	corner(thumb, Radius.Pill)
 
 	local state = default
+	local control
 
 	local function set(value, fireCallback)
+		value = value == true
+		local changed = state ~= value
 		state = value
 		tween(track, Motion.Toggle, { BackgroundColor3 = state and Colors.AccentGreen or Colors.BorderSubtle })
 		tween(thumb, Motion.Toggle, { Position = UDim2.fromOffset(state and 22 or 2, 2) })
+		if changed and control then
+			control:__EmitChanged(state)
+		end
 		if fireCallback then
 			task.spawn(callback, state)
 		end
@@ -2180,7 +2412,7 @@ function TabMeta:CreateToggle(config)
 		set(not state, true)
 	end)
 
-	local control = {
+	control = {
 		Type = "Toggle",
 		-- fires the callback (unlike a purely-cosmetic Set) so LoadConfig actually re-applies the effect
 		-- (e.g. a restored "Fly Hack: true" really re-enables flying, not just flips the switch visually),
@@ -2313,18 +2545,24 @@ function TabMeta:CreateSlider(config)
 	themed(fill, "BackgroundColor3", "AccentBlue")
 	corner(fill, Radius.Pill)
 
+	local control
 	local function setFromAlpha(alpha)
 		alpha = math.clamp(alpha, 0, 1)
 		local raw = min + (max - min) * alpha
 		-- `increment <= 0` divides by zero on every single drag frame (not just at creation, unlike
 		-- min==max above) — falls back to an unquantized/continuous value instead of erroring, which is
 		-- the closest sane behavior to "no snapping" for a bad or zero increment.
-		value = increment > 0
+		local nextValue = increment > 0
 			and math.clamp(math.floor(raw / increment + 0.5) * increment, min, max)
 			or math.clamp(raw, min, max)
+		local changed = value ~= nextValue
+		value = nextValue
 		local drawAlpha = toAlpha(value)
 		tween(fill, Motion.Press, { Size = UDim2.fromScale(drawAlpha, 1) })
 		valueInput.Text = tostring(value)
+		if changed and control then
+			control:__EmitChanged(value)
+		end
 		task.spawn(callback, value)
 	end
 
@@ -2372,7 +2610,7 @@ function TabMeta:CreateSlider(config)
 			setFromAlpha(relX)
 		end
 	end))
-	local control = {
+	control = {
 		Type = "Slider",
 		Set = function(_, v)
 			setFromAlpha(toAlpha(v))
@@ -2520,6 +2758,8 @@ function TabMeta:CreateDropdown(config)
 	local optLabels = {}
 	local optButtons = {}
 	local open = false
+	local control
+	local selectOption
 
 	local function highlight()
 		for option, optLabel in pairs(optLabels) do
@@ -2527,6 +2767,23 @@ function TabMeta:CreateDropdown(config)
 				TextColor3 = option == current and Colors.AccentBlue or Colors.TextSecondary,
 			})
 		end
+	end
+
+	selectOption = function(option, fireCallback)
+		if not optLabels[option] then
+			return false
+		end
+		local changed = current ~= option
+		current = option
+		btnLabel.Text = option
+		highlight()
+		if changed and control then
+			control:__EmitChanged(current)
+		end
+		if fireCallback then
+			task.spawn(callback, current)
+		end
+		return changed
 	end
 	onTheme(highlight)
 
@@ -2584,11 +2841,8 @@ function TabMeta:CreateDropdown(config)
 			optLabels[option] = optLabel
 			optButtons[option] = opt
 			opt.MouseButton1Click:Connect(function()
-				current = option
-				btnLabel.Text = option
+				selectOption(option, true)
 				setOpen(false)
-				highlight()
-				task.spawn(callback, current)
 			end)
 		end
 		local count = filterOptions(searchBox and searchBox.Text or "")
@@ -2654,21 +2908,16 @@ function TabMeta:CreateDropdown(config)
 		setOpen(not open)
 	end)
 
-	local control = {
+	control = {
 		Type = "Dropdown",
 		Set = function(_, option)
-			if not optLabels[option] then
-				return
-			end
-			current = option
-			btnLabel.Text = option
-			highlight()
-			task.spawn(callback, current)
+			selectOption(option, true)
 		end,
 		Get = function()
 			return current
 		end,
 		Refresh = function(_, newOptions)
+			local previous = current
 			options = newOptions or {}
 			rebuildOptions()
 			if not optLabels[current] then
@@ -2676,6 +2925,9 @@ function TabMeta:CreateDropdown(config)
 			end
 			btnLabel.Text = current
 			highlight()
+			if current ~= previous then
+				control:__EmitChanged(current)
+			end
 			if open then
 				positionFlyout(sheet, btn, list, listHeight)
 				tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, listHeight) })
@@ -2731,8 +2983,11 @@ function TabMeta:CreateInput(config)
 	-- last known-good value for NumbersOnly's revert-on-invalid path below. Starts at `default` since
 	-- that's what's actually sitting in the box before the user touches it.
 	local lastValidNumberText = default
+	local currentValue = default
+	local control
 
 	local function commit(fireCallback)
+		local previous = currentValue
 		local v = box.Text
 		if numbersOnly then
 			-- Character-filtering alone (stripping anything that isn't a digit/dot/minus) still let
@@ -2750,6 +3005,10 @@ function TabMeta:CreateInput(config)
 			end
 			box.Text = v
 		end
+		currentValue = v
+		if previous ~= v and control then
+			control:__EmitChanged(v)
+		end
 		if fireCallback then
 			task.spawn(callback, v)
 		end
@@ -2759,14 +3018,14 @@ function TabMeta:CreateInput(config)
 		commit(true)
 	end)
 
-	local control = {
+	control = {
 		Type = "Input",
 		Set = function(_, value)
 			box.Text = tostring(value)
 			commit(false)
 		end,
 		Get = function()
-			return box.Text
+			return currentValue
 		end,
 	}
 	if config.Flag then
@@ -2800,6 +3059,7 @@ function TabMeta:CreateKeybind(config)
 	end
 
 	local currentKey = safeKeyCode(config.CurrentKeybind)
+	local control
 
 	local row, disableOverlay = baseRow(self, 40)
 	local block, titleLabel, descLabel = labelBlock(row, name, config.Description)
@@ -2849,8 +3109,12 @@ function TabMeta:CreateKeybind(config)
 			if input.KeyCode == Enum.KeyCode.Escape then
 				btnLabel.Text = currentKey and currentKey.Name or "None"
 			else
+				local changed = currentKey ~= input.KeyCode
 				currentKey = input.KeyCode
 				btnLabel.Text = currentKey.Name
+				if changed and control then
+					control:__EmitChanged(currentKey.Name)
+				end
 				task.spawn(changedCallback, currentKey.Name)
 			end
 			tween(btnLabel, Motion.Tab, { TextColor3 = Colors.TextPrimary })
@@ -2861,10 +3125,12 @@ function TabMeta:CreateKeybind(config)
 		end
 	end))
 
-	local control = {
+	control = {
 		Type = "Keybind",
 		Set = function(_, keyName)
-			currentKey = safeKeyCode(keyName)
+			local nextKey = safeKeyCode(keyName)
+			local changed = currentKey ~= nextKey
+			currentKey = nextKey
 			btnLabel.Text = currentKey and currentKey.Name or "None"
 			-- Was silently missing: a manual rebind through the UI fired `changedCallback` (see the
 			-- InputBegan listener above), but `Set()` — which is what `LoadConfig` calls — didn't, so a
@@ -2872,6 +3138,9 @@ function TabMeta:CreateKeybind(config)
 			-- hint label elsewhere) never heard about a config-restored bind. Deliberately still NOT firing
 			-- the main `callback` here (that's the "hotkey was pressed" action-trigger — firing it from a
 			-- config load would misfire the action itself), only the identity-change notification.
+			if changed then
+				control:__EmitChanged(currentKey and currentKey.Name or nil)
+			end
 			task.spawn(changedCallback, currentKey and currentKey.Name or nil)
 		end,
 		Get = function()
@@ -3246,13 +3515,30 @@ function TabMeta:CreateMultiDropdown(config)
 	})
 	themed(btnLabel, "TextColor3", "TextPrimary")
 
-	local function refreshLabel()
-		local names = {}
+	local function getSelected()
+		local result = {}
 		for _, option in ipairs(options) do
 			if selected[option] then
-				table.insert(names, option)
+				table.insert(result, option)
 			end
 		end
+		return result
+	end
+
+	local function sameSelection(left, right)
+		if #left ~= #right then
+			return false
+		end
+		for i, value in ipairs(left) do
+			if right[i] ~= value then
+				return false
+			end
+		end
+		return true
+	end
+
+	local function refreshLabel()
+		local names = getSelected()
 		btnLabel.Text = #names == 0 and "None" or table.concat(names, ", ")
 	end
 	refreshLabel()
@@ -3360,6 +3646,7 @@ function TabMeta:CreateMultiDropdown(config)
 	local optButtons = {}
 	local open = false
 	local setOpen
+	local control
 
 	local function filterOptions(query)
 		query = string.lower(query or "")
@@ -3427,11 +3714,9 @@ function TabMeta:CreateMultiDropdown(config)
 				selected[option] = not selected[option]
 				tween(check, Motion.Tab, { BackgroundColor3 = selected[option] and Colors.AccentBlue or Colors.BgFrame })
 				refreshLabel()
-				local result = {}
-				for _, o in ipairs(options) do
-					if selected[o] then
-						table.insert(result, o)
-					end
+				local result = getSelected()
+				if control then
+					control:__EmitChanged(result)
 				end
 				task.spawn(callback, result)
 			end)
@@ -3504,19 +3789,10 @@ function TabMeta:CreateMultiDropdown(config)
 		setOpen(not open)
 	end)
 
-	local function getSelected()
-		local result = {}
-		for _, o in ipairs(options) do
-			if selected[o] then
-				table.insert(result, o)
-			end
-		end
-		return result
-	end
-
-	local control = {
+	control = {
 		Type = "MultiDropdown",
 		Set = function(_, optionsList)
+			local previous = getSelected()
 			optionsList = optionsList or {}
 			for k in pairs(selected) do
 				selected[k] = nil
@@ -3528,10 +3804,15 @@ function TabMeta:CreateMultiDropdown(config)
 				check.BackgroundColor3 = selected[option] and Colors.AccentBlue or Colors.BgFrame
 			end
 			refreshLabel()
-			task.spawn(callback, getSelected())
+			local result = getSelected()
+			if not sameSelection(previous, result) then
+				control:__EmitChanged(result)
+			end
+			task.spawn(callback, result)
 		end,
 		Get = getSelected,
 		Refresh = function(_, newOptions)
+			local previous = getSelected()
 			options = newOptions or {}
 			local stillValid = {}
 			for _, o in ipairs(options) do
@@ -3544,6 +3825,10 @@ function TabMeta:CreateMultiDropdown(config)
 			end
 			rebuildOptions()
 			refreshLabel()
+			local result = getSelected()
+			if not sameSelection(previous, result) then
+				control:__EmitChanged(result)
+			end
 			if open then
 				positionFlyout(sheet, btn, list, listHeight)
 				tween(list, Motion.Tab, { Size = UDim2.fromOffset(flyoutWidth, listHeight) })
@@ -3728,19 +4013,29 @@ function TabMeta:CreateColorPicker(config)
 
 	local svDragging, hueDragging = false, false
 
+	local control
+	local function emitColorChanged(previous)
+		local color = currentColor()
+		if control and previous ~= color then
+			control:__EmitChanged(color)
+		end
+		return color
+	end
 	local function updateSV(pos)
+		local previous = currentColor()
 		local relX = math.clamp((pos.X - svBox.AbsolutePosition.X) / svBox.AbsoluteSize.X, 0, 1)
 		local relY = math.clamp((pos.Y - svBox.AbsolutePosition.Y) / svBox.AbsoluteSize.Y, 0, 1)
 		sat = relX
 		val = 1 - relY
 		updateVisuals()
-		task.spawn(callback, currentColor())
+		task.spawn(callback, emitColorChanged(previous))
 	end
 	local function updateHue(pos)
+		local previous = currentColor()
 		local relX = math.clamp((pos.X - hueBar.AbsolutePosition.X) / hueBar.AbsoluteSize.X, 0, 1)
 		hue = relX
 		updateVisuals()
-		task.spawn(callback, currentColor())
+		task.spawn(callback, emitColorChanged(previous))
 	end
 
 	svButton.MouseButton1Down:Connect(function(x, y)
@@ -3768,6 +4063,7 @@ function TabMeta:CreateColorPicker(config)
 	end))
 
 	hexBox.FocusLost:Connect(function()
+		local previous = currentColor()
 		local hexStr = hexBox.Text:gsub("#", "")
 		if #hexStr == 6 and hexStr:match("^%x+$") then
 			local r = tonumber(hexStr:sub(1, 2), 16) / 255
@@ -3775,7 +4071,7 @@ function TabMeta:CreateColorPicker(config)
 			local b = tonumber(hexStr:sub(5, 6), 16) / 255
 			hue, sat, val = Color3.new(r, g, b):ToHSV()
 			updateVisuals()
-			task.spawn(callback, currentColor())
+			task.spawn(callback, emitColorChanged(previous))
 		else
 			updateVisuals() -- invalid text, snap back to the last valid color
 		end
@@ -3831,15 +4127,16 @@ function TabMeta:CreateColorPicker(config)
 		setOpen(not open)
 	end)
 
-	local control = {
+	control = {
 		Type = "ColorPicker",
 		Set = function(_, color)
+			local previous = currentColor()
 			hue, sat, val = color:ToHSV()
 			updateVisuals()
 			-- was silently missing: LoadConfig restoring a saved color updated the swatch/panel but never
 			-- told the host script to actually re-apply it (e.g. an aura's real color never changed) — same
 			-- class of bug as MultiDropdown's Set above, and the one already fixed for Toggle previously.
-			task.spawn(callback, currentColor())
+			task.spawn(callback, emitColorChanged(previous))
 		end,
 		Get = function()
 			return currentColor()

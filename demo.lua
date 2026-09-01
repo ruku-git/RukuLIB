@@ -44,27 +44,93 @@ Main:CreateParagraph({
 })
 
 Main:CreateLabel({ Text = "Core widgets — Toggle, Slider, Dropdown, ProgressBar, Divider, Button" })
-Main:CreateToggle({
+local Fly = Main:CreateToggle({
 	Name = "Fly Hack",
 	Flag = "FlyHack",
 	Callback = function(v) print("Fly Hack ->", v) end,
 })
-Main:CreateSlider({
+local Speed = Main:CreateSlider({
 	Name = "Speed (Click-to-Edit)",
 	Range = { 16, 200 },
 	CurrentValue = 16,
 	Flag = "Speed",
 	Callback = function(v) print("Speed ->", v) end,
 })
-Main:CreateDropdown({
+local Mode = Main:CreateDropdown({
 	Name = "Mode",
-	Options = { "Walk", "Noclip", "God" },
+	Options = { "Walk", "Noclip", "God", "Advanced" },
 	CurrentOption = "Walk",
 	Flag = "Mode",
 	Callback = function(v) print("Mode ->", v) end,
 })
 
+-- Dependencies evaluate immediately and react to both UI input and programmatic :Set calls.
+Speed:DependOn(Fly)
+local AdvancedSpeed = Main:CreateSlider({
+	Name = "Advanced Speed",
+	Range = { 16, 350 },
+	CurrentValue = 120,
+	Callback = function(v) print("Advanced Speed ->", v) end,
+})
+AdvancedSpeed:DependOn(Mode, function(value)
+	return value == "Advanced"
+end)
+
+local AdvancedMode = Main:CreateToggle({
+	Name = "Advanced Mode Enabled",
+	Callback = function(v) print("Advanced Mode Enabled ->", v) end,
+})
+local AirControl = Main:CreateSlider({
+	Name = "Air Control",
+	Range = { 0, 100 },
+	CurrentValue = 50,
+	Callback = function(v) print("Air Control ->", v) end,
+})
+AirControl:DependOnAll({ Fly, AdvancedMode })
+local PrecisionBurst = Main:CreateButton({
+	Name = "Precision Burst (Aggregate Dependency)",
+	Callback = function() print("Precision burst fired") end,
+})
+PrecisionBurst:DependOnAll({ Fly, Mode, AdvancedMode }, function(values)
+	return values[1] == true and values[2] == "Advanced" and values[3] == true
+end)
+
 Main:CreateDivider()
+
+Main:CreateParagraph({
+	Title = "Reactive dependencies",
+	Content = "Speed follows Fly Hack. Advanced Speed requires Mode = Advanced. Air Control requires both Fly Hack and Advanced Mode Enabled.",
+})
+
+Main:CreateButton({
+	Name = "Programmatic Dependency Probe",
+	Callback = function()
+		Fly:Set(true)
+		Mode:Set("Advanced")
+		AdvancedMode:Set(true)
+		Library:Notify({ Title = "Dependencies Updated", Text = "All three dependent sliders were updated through public :Set calls." })
+	end,
+})
+
+Main:CreateButton({
+	Name = "Manually Disable Speed",
+	Callback = function()
+		Speed:SetEnabled(false)
+		Library:Notify({ Title = "Manual Gate", Text = "Speed stays disabled even while Fly Hack is enabled." })
+	end,
+})
+
+Main:CreateButton({
+	Name = "Manually Enable Speed",
+	Callback = function()
+		Speed:SetEnabled(true)
+		Library:Notify({ Title = "Manual Gate", Text = "Speed is enabled only if Fly Hack also passes its dependency." })
+	end,
+})
+
+local dependencyListener = Fly:OnChanged(function(value)
+	print("Fly dependency source changed ->", value)
+end)
 
 local DemoProgress = Main:CreateProgressBar({
 	Name = "Task Progress",
@@ -118,7 +184,7 @@ Visuals:CreateDropdown({
 	Callback = function(v) print("Target Item ->", v) end,
 })
 
-Visuals:CreateMultiDropdown({
+local ESPFilters = Visuals:CreateMultiDropdown({
 	Name = "ESP Filters",
 	Description = "Searchable multi-select",
 	Searchable = true,
@@ -132,31 +198,87 @@ Visuals:CreateMultiDropdown({
 	Callback = function(list) print("ESP Filters ->", table.concat(list, ", ")) end,
 })
 
-Visuals:CreateColorPicker({
+local FilteredAction = Visuals:CreateButton({
+	Name = "Enemy Filter Action",
+	Callback = function() print("Enemy filter action fired") end,
+})
+FilteredAction:DependOn(ESPFilters, function(selected)
+	return table.find(selected, "Enemy Players") ~= nil
+end)
+
+local AuraColor = Visuals:CreateColorPicker({
 	Name = "Aura Color",
 	CurrentColor = Color3.fromRGB(10, 132, 255),
 	Flag = "AuraColor",
 	Callback = function(c) print("Aura Color ->", c) end,
 })
 
+local Brightness = Visuals:CreateSlider({
+	Name = "Brightness (Color Dependency)",
+	Range = { 0, 100 },
+	CurrentValue = 75,
+	Callback = function(v) print("Brightness ->", v) end,
+})
+Brightness:DependOn(AuraColor, function(color)
+	local _, _, value = color:ToHSV()
+	return value > 0.45
+end)
+
+Visuals:CreateButton({
+	Name = "Refresh Visual Options",
+	Callback = function()
+		local target = Library:GetControl("TargetItem")
+		if target then
+			target:Refresh({ "AK-47", "M4A1", "AWP Sniper", "Night Vision", "Thermal Scope" })
+		end
+		local filters = Library:GetControl("ESPFilters")
+		if filters then
+			filters:Refresh({ "Enemy Players", "Team Players", "Vehicles", "Aura" })
+		end
+		Library:Notify({ Title = "Options Refreshed", Text = "Dropdown and multi-dropdown refresh APIs exercised." })
+	end,
+})
+
 -- ================= Player: Input / Keybind =================
 local Player = Window:CreateTab({ Name = "Player", Icon = "stack" })
 
 Player:CreateLabel({ Text = "Text input + keybind capture" })
-Player:CreateInput({
+local TargetPlayer = Player:CreateInput({
 	Name = "Target Player",
 	PlaceholderText = "username",
 	Flag = "TargetPlayer",
 	Callback = function(v) print("Target Player ->", v) end,
 })
+local NumericInput = Player:CreateInput({
+	Name = "Numeric Only Example",
+	PlaceholderText = "0 - 999",
+	NumbersOnly = true,
+	CurrentValue = "42",
+	Callback = function(v) print("Numeric input ->", v) end,
+})
+local TargetAction = Player:CreateButton({
+	Name = "Targeted Action",
+	Callback = function() print("Targeted action fired") end,
+})
+TargetAction:DependOn(TargetPlayer, function(value)
+	return value ~= ""
+end)
 Player:CreateDivider()
-Player:CreateKeybind({
+local FlyBind = Player:CreateKeybind({
 	Name = "Fly Bind",
 	CurrentKeybind = "F",
 	Flag = "FlyBind",
 	Callback = function() print("Fly Bind pressed") end,
 	ChangedCallback = function(k) print("Fly Bind rebound ->", k) end,
 })
+
+local BoundAction = Player:CreateButton({
+	Name = "K-Bound Action",
+	Callback = function() print("K-Bound Action fired") end,
+})
+BoundAction:DependOn(FlyBind, function(keyName)
+	return keyName == "K"
+end)
 
 local NavSection = Player:CreateSection({ Title = "Programmatic Navigation" })
 NavSection:CreateButton({
@@ -234,6 +356,59 @@ Settings:CreateButton({
 	Name = "Test Notify",
 	Callback = function()
 		Library:Notify({ Title = "Hey", Text = "This is a toast notification.", Duration = 4 })
+	end,
+})
+
+local LifecycleSection = Settings:CreateSection({ Title = "Lifecycle API" })
+local LifecycleParagraph = LifecycleSection:CreateParagraph({
+	Title = "Mutable paragraph",
+	Content = "Buttons below exercise paragraph mutation, visibility, and per-control destruction.",
+})
+LifecycleSection:CreateButton({
+	Name = "Update Paragraph",
+	Callback = function()
+		LifecycleParagraph:Set({ Title = "Updated", Content = "SetTitle, SetContent, and Set all remain available." })
+	end,
+})
+LifecycleSection:CreateButton({
+	Name = "Toggle Paragraph Visibility",
+	Callback = function()
+		LifecycleParagraph:SetVisible(not LifecycleParagraph.__demoVisible)
+		LifecycleParagraph.__demoVisible = not LifecycleParagraph.__demoVisible
+	end,
+})
+LifecycleParagraph.__demoVisible = true
+local LifecycleToggle = LifecycleSection:CreateToggle({
+	Name = "Lifecycle target",
+	Description = "Buttons below mutate its standard lifecycle surface.",
+	Callback = function(v) print("Lifecycle target ->", v) end,
+})
+LifecycleSection:CreateButton({
+	Name = "Rename Lifecycle Target",
+	Callback = function()
+		LifecycleToggle:SetName("Lifecycle Target Updated")
+		LifecycleToggle:SetDescription("SetName and SetDescription updated this toggle in place.")
+	end,
+})
+LifecycleSection:CreateButton({
+	Name = "Destroy Lifecycle Target",
+	Callback = function()
+		LifecycleToggle:Destroy()
+		Library:Notify({ Title = "Control Destroyed", Text = "Per-control destruction cleaned up the target row." })
+	end,
+})
+LifecycleSection:CreateButton({
+	Name = "Disconnect Fly Listener",
+	Callback = function()
+		dependencyListener:Disconnect()
+		Library:Notify({ Title = "Listener Disconnected", Text = "Fly:OnChanged connection cleaned up." })
+	end,
+})
+LifecycleSection:CreateButton({
+	Name = "Clear Speed Dependencies",
+	Callback = function()
+		Speed:ClearDependencies()
+		Library:Notify({ Title = "Dependencies Cleared", Text = "Speed now obeys only its manual enabled state." })
 	end,
 })
 
