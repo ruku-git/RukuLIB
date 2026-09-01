@@ -1,3 +1,4 @@
+writefile("library.lua", [==========[
 --[[
 	iOS Roblox UI Lib
 	Rayfield-Gen2-shaped developer API, Apple HIG dark-mode + glassmorphism skin.
@@ -3861,3 +3862,4 @@ function TabMeta:CreateColorPicker(config)
 end
 
 return Library
+]==========])
