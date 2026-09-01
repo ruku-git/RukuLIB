@@ -1683,11 +1683,11 @@ function TabMeta:CreateParagraph(config)
 		Parent = self.Page,
 	})
 	if not self.FlatRows then
-		corner(row, Radius.Control)
+		corner(row, Radius.Card - 2)
 		stroke(row, 0.9, 1)
 	end
 	themed(row, "BackgroundColor3", "BgCard")
-	pad(row, nil, 8, Spacing.PaddingSide, 8, Spacing.PaddingSide)
+	pad(row, nil, 8, 10, 8, 10)
 
 	local layout = new("UIListLayout", {
 		SortOrder = Enum.SortOrder.LayoutOrder,
@@ -1734,14 +1734,15 @@ function TabMeta:CreateParagraph(config)
 	local disableOverlay = new("Frame", {
 		Name = "DisableOverlay",
 		Size = UDim2.fromScale(1, 1),
-		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundColor3 = Colors.BgBase,
 		BackgroundTransparency = 0.5,
 		Visible = false,
 		ZIndex = 4,
 		Parent = row,
 	})
+		themed(disableOverlay, "BackgroundColor3", "BgBase")
 	if not self.FlatRows then
-		corner(disableOverlay, Radius.Control)
+		corner(disableOverlay, Radius.Card - 2)
 	end
 
 	local control = {
