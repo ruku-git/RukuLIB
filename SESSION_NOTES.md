@@ -266,6 +266,57 @@ Checked whether `ThemeListeners` and `Library.Flags` have the same cross-executi
   - Live animation probe: enable transitioned `0 → 39 → 46px`; disable transitioned `46 → 6 → hidden`; rapid off/on sequences settled at the correct `visible=true`, `46px` state.
 - Regenerated `sync_workspace.lua`, deployed `library.lua` and `full_showcase_demo.lua` to executor storage, and confirmed `FULL_SHOWCASE_SMOKE_OK` with no new library errors. Temporary smoke/deployment wrappers were removed afterward.
 
+### Point 5 Completed — Documentation & API Alignment
+- Updated `MASTER.md` with Section 23 covering reactive control dependencies, dual-gate enablement, pointer event sinking with `TextButton` `DisabledOverlay`, and public lifecycle methods (`SetVisibleAnimated`, `IsEnabled`).
+- Updated top-level header API documentation in `library.lua`.
+- Aligned code and comments in `demo.lua` and `full_showcase_demo.lua`.
+
+### Pre-Work: Point 2 — Audit Remaining Widgets for Disabled Consistency
+- Target constructors in `library.lua`:
+  - `CreateToggle`: add `control:__IsEnabled()` guard to click and touch toggle event handlers before state flip or callback invocation.
+  - `CreateInput`: guard focus gain and `FocusLost` text commits so disabled inputs cannot accept keyboard focus or trigger callbacks.
+  - `CreateKeybind`: guard key capture initiation and bound hotkey callbacks so disabled keybinds do not trigger actions or enter binding mode.
+  - `CreateColorPicker`: guard flyout opening and interactive palette/hue/RGB/hex manipulation while gated or manually disabled.
+  - `CreateMultiDropdown`: guard flyout opening, search filtering, and item selection/toggling while gated.
+  - `CreateConfigManager`: guard save, load, delete actions, and editable config name focus while gated or manually disabled.
+- Testing plan:
+  - Deploy patched `library.lua` via `update_sync.py`.
+  - Run synthetic probes in Roblox executor to verify that disabled controls do not mutate state, open overlays, or fire callbacks.
+  - Re-enable and verify all interaction paths operate normally.
+  - Run `full_showcase_demo.lua` and verify zero console errors.
+
+### Point 2 Completed — Uniform Disabled Interaction Guards
+- Updated the remaining interactive constructors in `library.lua`: `CreateToggle`, `CreateInput`, `CreateKeybind`, `CreateColorPicker`, `CreateMultiDropdown`, and `CreateConfigManager`.
+- Every user-facing mutation route now checks `control:__IsEnabled()` before acting:
+  - Toggle track clicks and programmatic `Set` calls cannot flip a disabled toggle.
+  - Input focus is immediately released while disabled; `FocusLost`, commit logic, and programmatic `Set` calls are inert.
+  - Keybind capture cannot begin while disabled; disabling during capture cancels it; the global hotkey handler does not rebind or invoke the bound callback while gated.
+  - Color picker swatch opening, hue/SV dragging, hex focus/commit, and `Set` are all gated. Disabling closes an already-open color panel and cancels a drag.
+  - Multi-dropdown trigger, search focus/filtering, option selection, `Set`, and `Refresh` are gated. Disabling closes an already-open flyout.
+  - Config Manager now receives shared lifecycle gates across both rows: its save/load overlays mirror each other, name focus is rejected, and save/load/select/delete handlers are inert while disabled. Disabling closes its config flyout.
+- Extended lifecycle plumbing with optional mirrored disabled overlays for composite controls, plus a private `__CloseInteraction` hook invoked by `SetEnabled(false)` so an open flyout or active capture cannot remain live after its control is disabled.
+- Live verification on the connected Roblox client:
+  - Current `library.lua` compiled successfully from executor workspace (`{true, "table"}`).
+  - With all six controls manually disabled, direct connected-handler probes left all values unchanged, produced zero callbacks (`toggle/input/keybind/color/multi/config = 0`), rejected textbox focus, opened no flyouts, and created no config file.
+  - A live multi-dropdown opened while enabled and then became hidden immediately after `SetEnabled(false)` (`open=true → false`), confirming the new close-on-disable path.
+  - After re-enabling, Toggle changed to `true`, Input committed `"live"`, Keybind rebound to `L` and later fired its action callback, ColorPicker opened and changed its color, MultiDropdown selected one option, and ConfigManager saved `point2_enabled_final.json` with its callback firing once.
+  - Re-deployed `sync_workspace.lua`, seeded `full_showcase_demo.lua`, and executed the showcase smoke runner: `FULL_SHOWCASE_POINT2_OK` with no new runtime error.
+- Temporary Point 2 probe, smoke runner, and deployment wrapper were removed from the host project directory after verification. Test config files remain only in the executor sandbox and can be cleaned separately if desired.
+
+### Final Deployment Verification — Sep 1, 2026
+- Regenerated `sync_workspace.lua` immediately before the final deployment using `python update_sync.py`.
+- Connected to the refreshed Roblox client (`[UP] Just a baseplate`, job `a837738d-ba57-4035-b958-cd051edba1be`) and executed the generated sync wrapper successfully.
+- Verified executor-workspace load directly: `loadstring(readfile("library.lua"))()` compiled successfully and returned the `Library` table.
+- Seeded the current `full_showcase_demo.lua` into executor workspace and ran it under `pcall`; console result: `FULL_SHOWCASE_DEPLOY_VERIFY_OK`.
+- The final console scan showed no new runtime errors. Two library/notification roots were expected because the freshly launched showcase coexisted with an earlier test UI in the same client, rather than indicating a failed deployment.
+- Removed the temporary final-showcase deployment wrapper from the host project after verification.
+
+### Continue From Here
+- Point 1 (disabled overlay + animated dependent visibility), Point 5 (documentation alignment), and Point 2 (uniform defensive disabled interaction guards) are implemented, deployed, and verified.
+- The working deployment artifact is `sync_workspace.lua`; regenerate it with `python update_sync.py` after every `library.lua` edit before testing through the executor.
+- The next roadmap item has not been selected yet. Start the next session by reading this file, then review the remaining roadmap in `MASTER.md` before changing product code.
+- Keep the existing verification discipline: add a pre-work intent here, patch `library.lua`, regenerate/deploy `sync_workspace.lua`, run targeted client probes plus `full_showcase_demo.lua`, then record exact results here.
+
 ### Git state at last handoff
 
 - `main` pushed successfully: `c8c81b2..ff9a0cf`.

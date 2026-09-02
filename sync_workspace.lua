@@ -22,11 +22,12 @@ writefile("library.lua", [==========[
 	local progress = Tab:CreateProgressBar({Name = "Download", CurrentValue = 0}) -- display-only, no Flag
 	progress:SetProgress(0.4) -- 0-1; :SetText("12.4 / 80 MB") to override the auto "%" readout
 
-	-- every widget above shares this lifecycle: control:SetVisible(bool), control:SetEnabled(bool) (dims +
-	-- blocks input, doesn't just ignore the value), control:SetName(str), control:SetDescription(str) (no-op
-	-- on a widget with no label/description slot — Button/Label/Slider), control:Destroy() (tears down just
-	-- this row, unregisters its Flag). Every control table also carries a `.Type` string (e.g. "Toggle",
-	-- "Slider") so host code can branch on widget kind without inspecting method signatures.
+	-- every widget above shares this lifecycle: control:SetVisible(bool), control:SetVisibleAnimated(bool)
+	-- (tweens row height with UIListLayout reflow), control:SetEnabled(bool) (dims + blocks pointer input via
+	-- dedicated overlay button), control:SetName(str), control:SetDescription(str), control:DependOn(otherControl,
+	-- optionalPredicate), control:DependOnAll({c1, c2}, predicate), control:ClearDependencies(), and
+	-- control:Destroy() (tears down just this row, unregisters its Flag). Every control table also carries
+	-- a `.Type` string (e.g. "Toggle", "Slider") so host code can branch on widget kind without inspecting signatures.
 	speedSlider:SetEnabled(false) -- e.g. grey out until some other toggle turns the feature on
 	-- (in-app: clicking a slider's own value label turns it into a TextBox for typing an exact number)
 	modeDropdown:Refresh({"Walk", "Noclip", "Fly"}) -- Dropdown/MultiDropdown only: swap the option list live
@@ -1757,11 +1758,16 @@ end
 -- SetEnabled tracks host intent, while dependency state is a second gate, so a parent transition can never
 -- undo a manual disable. Every attached control receives OnChanged, DependOn, DependOnAll, and
 -- ClearDependencies; controls without Get simply cannot be dependency sources.
-local function attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, descParent, flagName)
+local function attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, descParent, flagName, additionalDisableOverlays)
 	local function applyEnabledState()
 		local enabled = control.__manualEnabled and control.__dependencyEnabled
 		if disableOverlay and disableOverlay.Parent then
 			disableOverlay.Visible = not enabled
+		end
+		for _, overlay in ipairs(additionalDisableOverlays or {}) do
+			if overlay and overlay.Parent then
+				overlay.Visible = not enabled
+			end
 		end
 	end
 
@@ -1969,6 +1975,9 @@ local function attachLifecycle(control, row, disableOverlay, titleLabel, descLab
 	control.SetEnabled = function(_, enabled)
 		control.__manualEnabled = enabled == true
 		applyEnabledState()
+		if not control.__manualEnabled and control.__CloseInteraction then
+			control:__CloseInteraction()
+		end
 	end
 	control.SetName = function(_, name)
 		if titleLabel then
@@ -2459,6 +2468,9 @@ function TabMeta:CreateToggle(config)
 	local control
 
 	local function set(value, fireCallback)
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		value = value == true
 		local changed = state ~= value
 		state = value
@@ -2478,6 +2490,9 @@ function TabMeta:CreateToggle(config)
 	end)
 
 	track.MouseButton1Click:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		set(not state, true)
 	end)
 
@@ -2975,8 +2990,13 @@ function TabMeta:CreateDropdown(config)
 	setOpen = setOpenImpl
 
 	if searchBox then
+		searchBox.Focused:Connect(function()
+			if control and control.__IsEnabled and not control:__IsEnabled() then
+				searchBox:ReleaseFocus()
+			end
+		end)
 		searchBox:GetPropertyChangedSignal("Text"):Connect(function()
-			if not open then return end
+			if not open or (control and control.__IsEnabled and not control:__IsEnabled()) then return end
 			local count = filterOptions(searchBox.Text)
 			listHeight = searchH + (math.min(count, maxVisible) * 24)
 			positionFlyout(sheet, btn, list, listHeight)
@@ -3024,6 +3044,9 @@ function TabMeta:CreateDropdown(config)
 		Library.Flags[config.Flag] = control
 	end
 	attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, block, config.Flag)
+	control.__CloseInteraction = function()
+		setOpen(false)
+	end
 	local baseDestroy = control.Destroy
 	control.Destroy = function()
 		sheetResizeConn:Disconnect()
@@ -3073,6 +3096,9 @@ function TabMeta:CreateInput(config)
 	local control
 
 	local function commit(fireCallback)
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		local previous = currentValue
 		local v = box.Text
 		if numbersOnly then
@@ -3100,13 +3126,24 @@ function TabMeta:CreateInput(config)
 		end
 	end
 
+	box.Focused:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			box:ReleaseFocus()
+		end
+	end)
 	box.FocusLost:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		commit(true)
 	end)
 
 	control = {
 		Type = "Input",
 		Set = function(_, value)
+			if control.__IsEnabled and not control:__IsEnabled() then
+				return
+			end
 			box.Text = tostring(value)
 			commit(false)
 		end,
@@ -3178,6 +3215,9 @@ function TabMeta:CreateKeybind(config)
 	end)
 
 	btn.MouseButton1Click:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		listening = true
 		btnLabel.Text = "..."
 		tween(btnLabel, Motion.Tab, { TextColor3 = Colors.AccentBlue })
@@ -3187,6 +3227,14 @@ function TabMeta:CreateKeybind(config)
 	-- setting); otherwise, a press matching `currentKey` fires the bound callback. `gameProcessed` is
 	-- checked only for the fire path so binding capture still works even over a focused chat box etc.
 	trackConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			if listening then
+				listening = false
+				btnLabel.Text = currentKey and currentKey.Name or "None"
+				tween(btnLabel, Motion.Tab, { TextColor3 = Colors.TextPrimary })
+			end
+			return
+		end
 		if listening then
 			if input.UserInputType ~= Enum.UserInputType.Keyboard then
 				return
@@ -3214,6 +3262,9 @@ function TabMeta:CreateKeybind(config)
 	control = {
 		Type = "Keybind",
 		Set = function(_, keyName)
+			if control.__IsEnabled and not control:__IsEnabled() then
+				return
+			end
 			local nextKey = safeKeyCode(keyName)
 			local changed = currentKey ~= nextKey
 			currentKey = nextKey
@@ -3236,7 +3287,15 @@ function TabMeta:CreateKeybind(config)
 	if config.Flag then
 		Library.Flags[config.Flag] = control
 	end
-	return attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, block, config.Flag)
+	attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, block, config.Flag)
+	control.__CloseInteraction = function()
+		if listening then
+			listening = false
+			btnLabel.Text = currentKey and currentKey.Name or "None"
+			tween(btnLabel, Motion.Tab, { TextColor3 = Colors.TextPrimary })
+		end
+	end
+	return control
 end
 
 -- Named config save/load UI on top of Library:SaveConfig/LoadConfig/ListConfigs/DeleteConfig. Doesn't
@@ -3251,9 +3310,10 @@ end
 function TabMeta:CreateConfigManager(config)
 	config = config or {}
 	local callback = config.Callback or function() end -- (action, name, ok, err)
+	local control
 
 	-- ---- row 1: Save Config (left) + name box (right) ----
-	local saveRow = baseRow(self, 40)
+	local saveRow, saveDisableOverlay = baseRow(self, 40)
 	local saveBtn = new("TextButton", {
 		Size = UDim2.new(0.5, -4, 1, 0),
 		BackgroundColor3 = Colors.AccentBlue,
@@ -3274,9 +3334,15 @@ function TabMeta:CreateConfigManager(config)
 	})
 	themed(saveLabel, "TextColor3", "TextPrimary")
 	saveBtn.MouseButton1Down:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		tween(saveBtn, Motion.Press, { BackgroundTransparency = 0.35 })
 	end)
 	saveBtn.MouseButton1Up:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		tween(saveBtn, Motion.Hover, { BackgroundTransparency = 0 })
 	end)
 
@@ -3301,7 +3367,16 @@ function TabMeta:CreateConfigManager(config)
 	stroke(nameBox, 0.85, 1)
 	pad(nameBox, nil, 0, 8, 0, 8)
 
+	nameBox.Focused:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			nameBox:ReleaseFocus()
+		end
+	end)
+
 	saveBtn.MouseButton1Click:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		local typedName = nameBox.Text
 		local ok, result = Library:SaveConfig(typedName)
 		task.spawn(callback, "save", ok and result or typedName, ok, result)
@@ -3309,7 +3384,7 @@ function TabMeta:CreateConfigManager(config)
 	end)
 
 	-- ---- row 2: Load Config (left) + selection box (right, opens the flyout of saved configs) ----
-	local loadRow = baseRow(self, 40)
+	local loadRow, loadDisableOverlay = baseRow(self, 40)
 	local loadBtn = new("TextButton", {
 		Size = UDim2.new(0.5, -4, 1, 0),
 		BackgroundColor3 = Colors.BgFrame,
@@ -3441,11 +3516,17 @@ function TabMeta:CreateConfigManager(config)
 			-- Picking a row only loads it INTO the selection box — it does not call Library:LoadConfig.
 			-- "Load Config" (the button on this row's other half) is the deliberate commit step.
 			optBtn.MouseButton1Click:Connect(function()
+				if control and control.__IsEnabled and not control:__IsEnabled() then
+					return
+				end
 				selected = cfgName
 				selectLabel.Text = cfgName
 				setOpen(false)
 			end)
 			delBtn.MouseButton1Click:Connect(function()
+				if control and control.__IsEnabled and not control:__IsEnabled() then
+					return
+				end
 				Library:DeleteConfig(cfgName)
 				if selected == cfgName then
 					-- the box was pointing at a config that no longer exists — clear it rather than let
@@ -3524,16 +3605,28 @@ function TabMeta:CreateConfigManager(config)
 	local sheetResizeConn = sheet:GetPropertyChangedSignal("AbsoluteSize"):Connect(reposition)
 
 	selectBtn.MouseButton1Click:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		setOpen(not open)
 	end)
 
 	loadBtn.MouseButton1Down:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		tween(loadBtn, Motion.Press, { BackgroundTransparency = 0.2 })
 	end)
 	loadBtn.MouseButton1Up:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		tween(loadBtn, Motion.Hover, { BackgroundTransparency = 0 })
 	end)
 	loadBtn.MouseButton1Click:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		if not selected then
 			task.spawn(callback, "load", nil, false, "no config selected")
 			return
@@ -3542,24 +3635,32 @@ function TabMeta:CreateConfigManager(config)
 		task.spawn(callback, "load", selected, ok, err)
 	end)
 
-	-- No SetEnabled/SetName here — this is a two-row action panel with no single value or label to point
-	-- either at (unlike every other widget, which is exactly one row with one name). SetVisible/Destroy
-	-- still make sense (and are cheap), just applied to both rows instead of a labelBlock/disableOverlay
-	-- this widget never built.
-	return {
+	-- Config Manager spans two rows, so lifecycle uses saveRow as its primary row and mirrors its enabled
+	-- overlay to loadRow. This keeps both action surfaces under the same dual-gate contract.
+	control = {
 		Type = "ConfigManager",
 		Refresh = rebuildRows,
 		SetVisible = function(_, visible)
 			saveRow.Visible = visible
 			loadRow.Visible = visible
 		end,
-		Destroy = function()
-			sheetResizeConn:Disconnect()
-			saveRow:Destroy()
-			loadRow:Destroy()
-			list:Destroy()
-		end,
 	}
+	attachLifecycle(control, saveRow, saveDisableOverlay, nil, nil, nil, nil, { loadDisableOverlay })
+	control.__CloseInteraction = function()
+		setOpen(false)
+	end
+	control.SetVisible = function(_, visible)
+		saveRow.Visible = visible
+		loadRow.Visible = visible
+	end
+	local baseDestroy = control.Destroy
+	control.Destroy = function()
+		sheetResizeConn:Disconnect()
+		list:Destroy()
+		loadRow:Destroy()
+		baseDestroy()
+	end
+	return control
 end
 
 function TabMeta:CreateMultiDropdown(config)
@@ -3797,6 +3898,9 @@ function TabMeta:CreateMultiDropdown(config)
 			checks[option] = check
 			optButtons[option] = opt
 			opt.MouseButton1Click:Connect(function()
+				if control and control.__IsEnabled and not control:__IsEnabled() then
+					return
+				end
 				selected[option] = not selected[option]
 				tween(check, Motion.Tab, { BackgroundColor3 = selected[option] and Colors.AccentBlue or Colors.BgFrame })
 				refreshLabel()
@@ -3852,8 +3956,13 @@ function TabMeta:CreateMultiDropdown(config)
 	setOpen = setOpenImpl
 
 	if searchBox then
+		searchBox.Focused:Connect(function()
+			if control and control.__IsEnabled and not control:__IsEnabled() then
+				searchBox:ReleaseFocus()
+			end
+		end)
 		searchBox:GetPropertyChangedSignal("Text"):Connect(function()
-			if not open then return end
+			if not open or (control and control.__IsEnabled and not control:__IsEnabled()) then return end
 			local count = filterOptions(searchBox.Text)
 			listHeight = searchH + (math.min(count, maxVisible) * 24)
 			positionFlyout(sheet, btn, list, listHeight)
@@ -3872,12 +3981,18 @@ function TabMeta:CreateMultiDropdown(config)
 	end)
 
 	btn.MouseButton1Click:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		setOpen(not open)
 	end)
 
 	control = {
 		Type = "MultiDropdown",
 		Set = function(_, optionsList)
+			if control.__IsEnabled and not control:__IsEnabled() then
+				return
+			end
 			local previous = getSelected()
 			optionsList = optionsList or {}
 			for k in pairs(selected) do
@@ -3898,6 +4013,9 @@ function TabMeta:CreateMultiDropdown(config)
 		end,
 		Get = getSelected,
 		Refresh = function(_, newOptions)
+			if control.__IsEnabled and not control:__IsEnabled() then
+				return
+			end
 			local previous = getSelected()
 			options = newOptions or {}
 			local stillValid = {}
@@ -3925,6 +4043,9 @@ function TabMeta:CreateMultiDropdown(config)
 		Library.Flags[config.Flag] = control
 	end
 	attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, block, config.Flag)
+	control.__CloseInteraction = function()
+		setOpen(false)
+	end
 	local baseDestroy = control.Destroy
 	control.Destroy = function()
 		sheetResizeConn:Disconnect()
@@ -4108,6 +4229,9 @@ function TabMeta:CreateColorPicker(config)
 		return color
 	end
 	local function updateSV(pos)
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		local previous = currentColor()
 		local relX = math.clamp((pos.X - svBox.AbsolutePosition.X) / svBox.AbsoluteSize.X, 0, 1)
 		local relY = math.clamp((pos.Y - svBox.AbsolutePosition.Y) / svBox.AbsoluteSize.Y, 0, 1)
@@ -4117,6 +4241,9 @@ function TabMeta:CreateColorPicker(config)
 		task.spawn(callback, emitColorChanged(previous))
 	end
 	local function updateHue(pos)
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		local previous = currentColor()
 		local relX = math.clamp((pos.X - hueBar.AbsolutePosition.X) / hueBar.AbsoluteSize.X, 0, 1)
 		hue = relX
@@ -4125,10 +4252,16 @@ function TabMeta:CreateColorPicker(config)
 	end
 
 	svButton.MouseButton1Down:Connect(function(x, y)
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		svDragging = true
 		updateSV(Vector2.new(x, y))
 	end)
 	hueButton.MouseButton1Down:Connect(function(x, y)
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		hueDragging = true
 		updateHue(Vector2.new(x, y))
 	end)
@@ -4148,7 +4281,16 @@ function TabMeta:CreateColorPicker(config)
 		end
 	end))
 
+	hexBox.Focused:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			hexBox:ReleaseFocus()
+		end
+	end)
 	hexBox.FocusLost:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			updateVisuals()
+			return
+		end
 		local previous = currentColor()
 		local hexStr = hexBox.Text:gsub("#", "")
 		if #hexStr == 6 and hexStr:match("^%x+$") then
@@ -4210,12 +4352,18 @@ function TabMeta:CreateColorPicker(config)
 	local sheetResizeConn = sheet:GetPropertyChangedSignal("AbsoluteSize"):Connect(reposition)
 
 	swatch.MouseButton1Click:Connect(function()
+		if control and control.__IsEnabled and not control:__IsEnabled() then
+			return
+		end
 		setOpen(not open)
 	end)
 
 	control = {
 		Type = "ColorPicker",
 		Set = function(_, color)
+			if control.__IsEnabled and not control:__IsEnabled() then
+				return
+			end
 			local previous = currentColor()
 			hue, sat, val = color:ToHSV()
 			updateVisuals()
@@ -4232,6 +4380,11 @@ function TabMeta:CreateColorPicker(config)
 		Library.Flags[config.Flag] = control
 	end
 	attachLifecycle(control, row, disableOverlay, titleLabel, descLabel, block, config.Flag)
+	control.__CloseInteraction = function()
+		svDragging = false
+		hueDragging = false
+		setOpen(false)
+	end
 	-- same override as CreateDropdown/CreateMultiDropdown, same reason: `panel` lives in `Overlay`, not
 	-- under `row`.
 	local baseDestroy = control.Destroy

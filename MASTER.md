@@ -316,4 +316,32 @@ Implementation and live verification of the Tier 2 roadmap batch across theming,
    - Wraps option items in a native `ScrollingFrame` with dynamic `CanvasSize` and configurable `MaxVisible` row height clamping.
    - Resets search query and displays all options automatically each time the dropdown is opened.
 
+## 22. Control Lifecycle, Dynamic Height Transitions, and Event Interception (Sep 1, 2026)
 
+1. **Animated Visibility Transitions (`control:SetVisibleAnimated(visible)`)**:
+   - Opt-in animated row reveal/collapse method exposed on all standard lifecycle-backed controls (`attachLifecycle`).
+   - Rather than instantly toggling `row.Visible`, it animates the row's vertical size (`row.Size = UDim2.new(1, 0, 0, targetHeight)`) using standard tab motion (`Motion.Tab`: 0.25s Quad Out).
+   - Because parent containers and sections use native Roblox `UIListLayout` elements, tweening the row height automatically reflows subsequent rows smoothly without manual positional offsetting.
+   - **Generation Guard (`visibleAnimationGen`)**: A monotonic integer generation token is incremented on every `SetVisible` and `SetVisibleAnimated` call. Stale tween `.Completed` callbacks from earlier rapid toggle cycles (e.g. fast on→off→on clicks) verify their generation token against `visibleAnimationGen` before writing `row.Visible = false`, preventing race conditions and permanent zero-height clipping.
+   - Instant `control:SetVisible(visible)` is preserved for zero-overhead initial setup and non-animated layout changes.
+
+2. **Pointer Sinking via `DisabledOverlay` (`TextButton`)**:
+   - In standard Roblox GUI rendering, passive GUI elements (like `Frame`s with `Active = true`) do not consistently sink mouse and touch input under certain client/executor input dispatch conditions, allowing clicks to pass through to underlying active buttons or slider tracks.
+   - Replaced `DisabledOverlay` with a transparent `TextButton` (`Active = true`, `AutoButtonColor = false`, `Text = ""`, `BackgroundTransparency = 1` when enabled, `0.4` when disabled, `ZIndex = 5`).
+   - Sits at the top of the row's internal Z-order hierarchy to guarantee 100% interception of mouse down, up, and drag interactions across all devices and platforms.
+
+3. **Internal Control Predicate (`control:__IsEnabled()`) & Defensive Event Guards**:
+   - Standardized an internal state evaluator on all lifecycle controls:
+     ```lua
+     control.__IsEnabled = function()
+         return not control.__destroyed and control.__manualEnabled and control.__dependencyEnabled
+     end
+     ```
+   - Input event listeners in `CreateButton`, `CreateSlider`, and `CreateDropdown` explicitly evaluate `control:__IsEnabled()` prior to triggering animations, slider drags, text editing, flyout toggles, or user callbacks.
+   - Ensures that programmatic or synthetic input dispatches cannot bypass visual disabled states.
+
+4. **Complete Interactive-Surface Coverage (Point 2)**:
+   - The same dual-gate guards now cover `CreateToggle`, `CreateInput`, `CreateKeybind`, `CreateColorPicker`, `CreateMultiDropdown`, and `CreateConfigManager`, not only Button/Slider/Dropdown.
+   - Text inputs reject focus and commits when gated; keybind capture/action paths reject disabled controls; color picker, multi-dropdown, and config-manager flyouts cannot open or mutate while gated.
+   - Composite and flyout-backed widgets register a private `control.__CloseInteraction` hook. `SetEnabled(false)` invokes it after updating overlays, closing an existing flyout and cancelling active capture/drag state so a control cannot retain an interaction begun before it became disabled.
+   - `CreateConfigManager` is a two-row composite control. Its lifecycle applies the primary disabled overlay to the save/name row and mirrors the same state to the load/select row, preserving one `SetEnabled` contract across both action surfaces.
