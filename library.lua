@@ -738,6 +738,10 @@ function Library:Notify(config)
 	corner(toast, Radius.Card)
 	stroke(toast, 0.85, 1)
 	pad(toast, nil, 10, 12, 10, 12)
+	-- A UIScale pop-in reads as more alive than the plain fade alone, without touching Position (which the
+	-- stack's own UIListLayout drives and would just fight over).
+	local scale = new("UIScale", { Scale = 0.9, Parent = toast })
+	tween(scale, Motion.Open, { Scale = 1 })
 	new("UIListLayout", {
 		SortOrder = Enum.SortOrder.LayoutOrder,
 		Padding = UDim.new(0, 2),
@@ -1681,13 +1685,15 @@ local function baseRow(tab, height)
 		Name = "Row" .. tab.RowCount,
 		Size = UDim2.new(1, 0, 0, height or 40),
 		BackgroundColor3 = Colors.BgCard,
-		BackgroundTransparency = tab.FlatRows and 1 or 0.5,
+		-- Rows inside a Section (FlatRows) used to render fully invisible (Transparency 1) — every
+		-- widget dropped into a section sat as bare text/controls with zero card separation, unlike a
+		-- top-level row's subtle BgCard tint. Giving them the same 0.5 tint makes each widget read as its
+		-- own gently-separated row no matter whether it's directly on a tab page or nested in a section.
+		BackgroundTransparency = 0.5,
 		LayoutOrder = tab.RowCount,
 		Parent = tab.Page,
 	})
-	if not tab.FlatRows then
-		themed(row, "BackgroundColor3", "BgCard") -- covers every widget's row background in one place
-	end
+	themed(row, "BackgroundColor3", "BgCard") -- covers every widget's row background in one place, section-nested or not
 	corner(row, Radius.Card - 2)
 	pad(row, nil, 8, 10, 8, 10)
 
@@ -2114,12 +2120,16 @@ function TabMeta:CreateParagraph(config)
 		Size = UDim2.new(1, 0, 0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y,
 		BackgroundColor3 = Colors.BgCard,
-		BackgroundTransparency = self.FlatRows and 1 or 0.5,
+		-- Matches baseRow's same fix: a section-nested Paragraph gets the same visible card tint as a
+		-- top-level one instead of sitting fully transparent. Corner now applies either way too, so the
+		-- card shape is consistent; only the extra outline stroke stays reserved for top-level rows (a
+		-- stroke on every section-nested paragraph would double up against the section's own border).
+		BackgroundTransparency = 0.5,
 		LayoutOrder = self.RowCount,
 		Parent = self.Page,
 	})
+	corner(row, Radius.Card - 2)
 	if not self.FlatRows then
-		corner(row, Radius.Card - 2)
 		stroke(row, 0.9, 1)
 	end
 	themed(row, "BackgroundColor3", "BgCard")
@@ -2177,9 +2187,7 @@ function TabMeta:CreateParagraph(config)
 		Parent = row,
 	})
 		themed(disableOverlay, "BackgroundColor3", "BgBase")
-	if not self.FlatRows then
-		corner(disableOverlay, Radius.Card - 2)
-	end
+	corner(disableOverlay, Radius.Card - 2) -- matches the row's now-always-rounded corner, section-nested or not
 
 	local control = {
 		Type = "Paragraph",
@@ -2539,6 +2547,18 @@ function TabMeta:CreateButton(config)
 	themed(btnLabel, "TextColor3", "AccentBlue")
 
 	local control = { Type = "Button" }
+	-- Row now carries a resting tint (baseRow's 0.5) instead of sitting fully invisible, so a hover dip
+	-- on top of it reads as a real button coming alive under the cursor, not just a click-to-flash label.
+	btn.MouseEnter:Connect(function()
+		if control.__IsEnabled and control:__IsEnabled() then
+			tween(row, Motion.Hover, { BackgroundTransparency = 0.35 })
+		end
+	end)
+	btn.MouseLeave:Connect(function()
+		if control.__IsEnabled and control:__IsEnabled() then
+			tween(row, Motion.Hover, { BackgroundTransparency = 0.5 })
+		end
+	end)
 	btn.MouseButton1Down:Connect(function()
 		if control.__IsEnabled and control:__IsEnabled() then
 			tween(row, Motion.Press, { BackgroundTransparency = 0.2 })
@@ -2546,7 +2566,7 @@ function TabMeta:CreateButton(config)
 	end)
 	btn.MouseButton1Up:Connect(function()
 		if control.__IsEnabled and control:__IsEnabled() then
-			tween(row, Motion.Hover, { BackgroundTransparency = 0.5 })
+			tween(row, Motion.Hover, { BackgroundTransparency = 0.35 })
 		end
 	end)
 	btn.MouseButton1Click:Connect(function()
@@ -2917,12 +2937,20 @@ function TabMeta:CreateDropdown(config)
 		for i, option in ipairs(options) do
 			local opt = new("TextButton", {
 				Size = UDim2.new(1, 0, 0, 24),
-				BackgroundTransparency = 1,
+				BackgroundColor3 = Color3.fromRGB(128, 128, 128),
+				BackgroundTransparency = 1, -- tweened to a faint hover wash below; idle stays invisible
 				Text = "",
 				LayoutOrder = i,
 				ZIndex = 10,
 				Parent = scroll,
 			})
+			corner(opt, 6)
+			opt.MouseEnter:Connect(function()
+				tween(opt, Motion.Hover, { BackgroundTransparency = 0.88 })
+			end)
+			opt.MouseLeave:Connect(function()
+				tween(opt, Motion.Hover, { BackgroundTransparency = 1 })
+			end)
 			local optLabel = new("TextLabel", {
 				Font = Fonts.SubBody,
 				Text = option,
@@ -3864,12 +3892,20 @@ function TabMeta:CreateMultiDropdown(config)
 		for i, option in ipairs(options) do
 			local opt = new("TextButton", {
 				Size = UDim2.new(1, 0, 0, 24),
-				BackgroundTransparency = 1,
+				BackgroundColor3 = Color3.fromRGB(128, 128, 128),
+				BackgroundTransparency = 1, -- tweened to a faint hover wash below; idle stays invisible
 				Text = "",
 				LayoutOrder = i,
 				ZIndex = 10,
 				Parent = scroll,
 			})
+			corner(opt, 6)
+			opt.MouseEnter:Connect(function()
+				tween(opt, Motion.Hover, { BackgroundTransparency = 0.88 })
+			end)
+			opt.MouseLeave:Connect(function()
+				tween(opt, Motion.Hover, { BackgroundTransparency = 1 })
+			end)
 			local check = new("Frame", {
 				Name = "Check",
 				AnchorPoint = Vector2.new(0, 0.5),
